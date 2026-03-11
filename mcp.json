@@ -1,0 +1,33 @@
+{
+  "mcpServers": {
+    "cockroachdb-toolbox": {
+      "command": "toolbox",
+      "args": ["--tools-file", "tools.yaml", "--stdio"],
+      "env": {
+        "COCKROACHDB_HOST": "${COCKROACHDB_HOST}",
+        "COCKROACHDB_PORT": "${COCKROACHDB_PORT}",
+        "COCKROACHDB_USER": "${COCKROACHDB_USER}",
+        "COCKROACHDB_PASSWORD": "${COCKROACHDB_PASSWORD}",
+        "COCKROACHDB_DATABASE": "${COCKROACHDB_DATABASE}"
+      }
+    },
+    "cockroachdb-toolbox-http": {
+      "type": "http",
+      "url": "http://127.0.0.1:5000/mcp",
+      "_comment": "Streamable HTTP transport — run 'toolbox --tools-file tools.yaml' first, then connect via this URL"
+    },
+    "ccloud": {
+      "command": "ccloud",
+      "args": ["mcp"],
+      "_comment": "CockroachDB Cloud CLI — manage clusters, backups, networking, and infrastructure. Coming soon.",
+      "env": {
+        "CCLOUD_API_KEY": "${CCLOUD_API_KEY}"
+      }
+    },
+    "cockroachdb-cloud": {
+      "type": "http",
+      "url": "https://mcp.cockroachlabs.cloud",
+      "_comment": "Official CockroachDB Cloud MCP Server — coming soon"
+    }
+  }
+}

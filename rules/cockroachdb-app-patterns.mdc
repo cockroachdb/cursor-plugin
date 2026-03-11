@@ -1,0 +1,695 @@
+---
+description: Application-level best practices and anti-patterns when building applications on CockroachDB. Covers transaction retry logic, ORM configuration, schema design, connection management, online DDL, batching, session guardrails, and multi-region patterns. Based on real-world production patterns from cockroachdb-best-practices-demo and cockroachdb-jdbc-wrapper.
+globs:
+  - "**/*.go"
+  - "**/*.py"
+  - "**/*.js"
+  - "**/*.ts"
+  - "**/*.java"
+  - "**/*.rb"
+  - "**/*.rs"
+  - "**/*.cs"
+  - "**/*.kt"
+  - "**/*.scala"
+  - "**/*.prisma"
+  - "**/schema.prisma"
+  - "**/docker-compose*.yml"
+  - "**/docker-compose*.yaml"
+  - "**/Dockerfile*"
+---
+
+# CockroachDB Application Patterns
+
+> These rules encode production-tested patterns from [cockroachdb-best-practices-demo](https://github.com/viragtripathi/cockroachdb-best-practices-demo) and [cockroachdb-jdbc-wrapper](https://github.com/viragtripathi/cockroachdb-jdbc-wrapper). Follow them strictly when generating code that interacts with CockroachDB.
+
+---
+
+## 1. Transaction Retry Logic (MANDATORY)
+
+CockroachDB defaults to **SERIALIZABLE** isolation — the strongest level. This means any two concurrent transactions touching the same rows may produce a **SQLSTATE 40001** (serialization failure). Applications **MUST** implement retry logic.
+
+### Retryable Error Codes
+
+| SQLSTATE | Meaning | Action |
+|----------|---------|--------|
+| `40001` | Serialization failure (transaction conflict) | **ALWAYS retry** the entire transaction |
+| `08001` | Unable to establish connection | Retry with backoff |
+| `08003` | Connection does not exist | Retry with new connection |
+| `08004` | Connection rejected by server | Retry with backoff |
+| `08006` | Connection failure during transaction | Retry with new connection |
+| `08007` | Transaction resolution unknown | Retry with new connection |
+| `08S01` | Communication link failure | Retry with new connection |
+| `57P01` | Admin shutdown (node drain/restart) | Retry with backoff |
+
+### Retry Strategy
+
+- Use **exponential backoff with jitter** (not fixed delays)
+- Recommended: base 200ms, multiplier 2×, jitter factor 0.5
+- Max attempts: 3–5 for interactive, 5–10 for background/batch
+- **Retry the ENTIRE transaction** — not just the failed statement
+
+### ⛔ ANTI-PATTERN: Savepoint-Based Retry
+
+```java
+// ❌ WRONG — This does NOT work with CockroachDB
+conn.setAutoCommit(false);
+Savepoint sp = conn.setSavepoint("cockroach_restart");
+try {
+    // ... SQL operations ...
+    conn.commit();
+} catch (SQLException e) {
+    if ("40001".equals(e.getSQLState())) {
+        conn.rollback(sp);  // ❌ CockroachDB aborts the ENTIRE txn on 40001
+        // retrying here is USELESS — the transaction is dead
+    }
+}
+```
+
+CockroachDB aborts the **entire transaction** on serialization failure. `ROLLBACK TO SAVEPOINT` cannot recover it. You must close/rollback and start a brand new transaction.
+
+### ✅ Correct Retry Patterns by Language
+
+#### Go — Using `cockroach-go/v2/crdb`
+
+```go
+import (
+    "database/sql"
+    "github.com/cockroachdb/cockroach-go/v2/crdb"
+    _ "github.com/jackc/pgx/v5/stdlib"
+)
+
+db, err := sql.Open("pgx", connStr)
+if err != nil {
+    log.Fatal(err)
+}
+
+// crdb.ExecuteTx handles 40001 retries automatically
+err = crdb.ExecuteTx(ctx, db, nil, func(tx *sql.Tx) error {
+    _, err := tx.ExecContext(ctx,
+        "UPDATE accounts SET balance = balance - $1 WHERE id = $2", amount, fromID)
+    if err != nil {
+        return err
+    }
+    _, err = tx.ExecContext(ctx,
+        "UPDATE accounts SET balance = balance + $1 WHERE id = $2", amount, toID)
+    return err
+})
+if err != nil {
+    log.Printf("transaction failed after retries: %v", err)
+}
+```
+
+#### Java — Using `cockroachdb-jdbc-wrapper` (RetryableExecutor)
+
+```java
+import com.cockroachdb.jdbc.retry.RetryableExecutor;
+
+// Default: 5 attempts, exponential random backoff (200ms base, 2× multiplier, 0.5 jitter)
+// Retries 40001 (serialization), 08xxx (connection), 57P01 (admin shutdown)
+RetryableExecutor executor = new RetryableExecutor();
+
+// For write transactions:
+executor.executeVoid(() -> {
+    try (Connection conn = dataSource.getConnection()) {
+        conn.setAutoCommit(false);
+        try (PreparedStatement debit = conn.prepareStatement(
+                "UPDATE accounts SET balance = balance - ? WHERE id = ?");
+             PreparedStatement credit = conn.prepareStatement(
+                "UPDATE accounts SET balance = balance + ? WHERE id = ?")) {
+            debit.setBigDecimal(1, amount);
+            debit.setObject(2, fromId);
+            debit.execute();
+            credit.setBigDecimal(1, amount);
+            credit.setObject(2, toId);
+            credit.execute();
+            conn.commit();
+        } catch (SQLException e) {
+            conn.rollback();
+            throw new RuntimeException(e);
+        }
+    }
+});
+
+// For read operations (returns a value):
+int count = executor.execute(() -> {
+    try (Connection conn = dataSource.getConnection();
+         PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM users");
+         ResultSet rs = ps.executeQuery()) {
+        rs.next();
+        return rs.getInt(1);
+    }
+});
+
+// Optional: wrap DataSource for automatic retry on commit()/rollback()
+DataSource retryable = new RetryableDataSource(pgDataSource);
+```
+
+#### Java — Custom Retry with Resilience4j
+
+```java
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+import io.github.resilience4j.retry.RetryRegistry;
+
+RetryConfig config = RetryConfig.custom()
+    .maxAttempts(5)
+    .intervalFunction(IntervalFunction.ofExponentialRandomBackoff(
+        Duration.ofMillis(200), 2.0, 0.5))  // 200ms base, 2× multiplier, 0.5 jitter
+    .retryOnException(e -> {
+        if (e instanceof SQLException sql) {
+            String state = sql.getSQLState();
+            if (state == null) return false;
+            return "40001".equals(state)             // serialization failure
+                || state.startsWith("08")            // connection errors
+                || "57P01".equals(state);            // admin shutdown
+        }
+        return false;
+    })
+    .build();
+
+Retry retry = RetryRegistry.of(config).retry("cockroachdb");
+Retry.decorateRunnable(retry, () -> transferFunds(fromId, toId, amount)).run();
+```
+
+#### Python — Manual Retry with psycopg2/psycopg3
+
+```python
+import psycopg2
+import random
+import time
+
+def run_with_retry(conn_params, txn_func, max_retries=5):
+    """Execute a transaction function with automatic retry on 40001."""
+    for attempt in range(max_retries):
+        conn = psycopg2.connect(**conn_params)
+        conn.autocommit = False
+        try:
+            txn_func(conn)
+            conn.commit()
+            return  # success
+        except psycopg2.OperationalError as e:
+            conn.rollback()
+            if e.pgcode == "40001" and attempt < max_retries - 1:
+                sleep_time = min(0.2 * (2 ** attempt), 5) * (0.5 + random.random() * 0.5)
+                time.sleep(sleep_time)
+                continue
+            raise
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+# Usage:
+def transfer_funds(conn):
+    with conn.cursor() as cur:
+        cur.execute("UPDATE accounts SET balance = balance - %s WHERE id = %s", (amount, from_id))
+        cur.execute("UPDATE accounts SET balance = balance + %s WHERE id = %s", (amount, to_id))
+
+run_with_retry(conn_params, transfer_funds)
+```
+
+#### Node.js — Retry Wrapper with `pg`
+
+```typescript
+import { Pool, PoolClient } from 'pg';
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 20 });
+
+async function runWithRetry<T>(
+  txnFn: (client: PoolClient) => Promise<T>,
+  maxRetries = 5
+): Promise<T> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await txnFn(client);
+      await client.query('COMMIT');
+      return result;
+    } catch (err: any) {
+      await client.query('ROLLBACK');
+      if (err.code === '40001' && attempt < maxRetries - 1) {
+        const delay = Math.min(200 * Math.pow(2, attempt), 5000)
+          * (0.5 + Math.random() * 0.5);
+        await new Promise(r => setTimeout(r, delay));
+        continue;
+      }
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+  throw new Error('Max retries exceeded');
+}
+
+// Usage:
+const result = await runWithRetry(async (client) => {
+  await client.query('UPDATE accounts SET balance = balance - $1 WHERE id = $2', [amount, fromId]);
+  await client.query('UPDATE accounts SET balance = balance + $1 WHERE id = $2', [amount, toId]);
+  return { success: true };
+});
+```
+
+---
+
+## 2. Contention and Hot Rows
+
+### ⛔ ANTI-PATTERN: More Threads on Hot Rows
+
+Adding more application pods, threads, or connections to a workload that writes to the same hot row does **NOT** increase throughput. It **decreases** it:
+
+- With N concurrent writers on the same row, only 1 can commit per round
+- The other N−1 are aborted with 40001 and must retry
+- More concurrency = more wasted work = lower TPS
+
+**Fix:** Redesign the schema to avoid hot rows. For counters, use per-shard counters or `UPDATE ... SET balance = balance + $1` (CockroachDB optimizes single-key blind writes). For queues, partition by hash.
+
+### ⛔ ANTI-PATTERN: Long Read-Modify-Write in One Transaction
+
+```sql
+-- ❌ WRONG — reading large data and writing in the same long transaction
+BEGIN;
+SELECT large_json_payload FROM orders WHERE id = $1;  -- slow read
+-- ... app processing ...
+UPDATE orders SET status = 'processed' WHERE id = $1;  -- delayed write
+COMMIT;
+```
+
+**Fix:** Split into three phases:
+
+```sql
+-- 1. Read with historical snapshot (no write intents, can use follower reads)
+SELECT large_json_payload FROM orders
+  AS OF SYSTEM TIME '-10s'
+  WHERE id = $1;
+
+-- 2. Process in application (no open transaction)
+
+-- 3. Short write transaction
+BEGIN;
+UPDATE orders SET status = 'processed' WHERE id = $1;
+COMMIT;
+```
+
+---
+
+## 3. Batch Operations
+
+### ⛔ ANTI-PATTERN: Row-by-Row Insert (N+1 Pattern)
+
+```java
+// ❌ WRONG — N round trips, ~50% time spent in network idle
+for (Order order : orders) {
+    stmt.executeUpdate("INSERT INTO orders VALUES (...)");
+}
+```
+
+### ✅ Correct: Use Batching
+
+```java
+// ✅ CORRECT — single round trip, 10-100× faster
+PreparedStatement ps = conn.prepareStatement(
+    "INSERT INTO orders (id, customer_id, amount) VALUES (?, ?, ?)");
+for (Order order : orders) {
+    ps.setObject(1, order.id());
+    ps.setObject(2, order.customerId());
+    ps.setBigDecimal(3, order.amount());
+    ps.addBatch();
+}
+ps.executeBatch();
+```
+
+- Batch 128–256 rows per `executeBatch()` call
+- For very large loads, use `IMPORT INTO` or `COPY FROM`
+- In Python, use `executemany()` or `psycopg2.extras.execute_values()`
+- In Go, use `pgx.Batch` or multi-row `INSERT INTO ... VALUES (...), (...), ...`
+
+---
+
+## 4. Session Guardrails
+
+Set these in development and staging to catch runaway queries early:
+
+```sql
+-- Abort transactions that read too many rows (catches missing WHERE)
+SET transaction_rows_read_err = 10000;
+
+-- Abort transactions that write too many rows
+SET transaction_rows_written_err = 5000;
+
+-- Warn before the limit is hit
+SET transaction_rows_read_log = 5000;
+SET transaction_rows_written_log = 2500;
+```
+
+### ⛔ ANTI-PATTERN: Unbounded Queries in Transactions
+
+```sql
+-- ❌ WRONG — full table scan, blocks other transactions
+BEGIN;
+SELECT * FROM orders;  -- reads millions of rows
+COMMIT;
+
+-- ❌ WRONG — bulk update without WHERE
+UPDATE orders SET status = 'archived';
+```
+
+**Fix:** Always use `WHERE` clauses and `LIMIT`. Chunk bulk operations.
+
+---
+
+## 5. Transaction Size Limits
+
+CockroachDB has a **16MB transaction payload limit** across ALL statements in a transaction. This is not just about single large rows — a transaction with 25 statements each writing 500KB = 12.5MB, approaching the limit.
+
+### ⛔ ANTI-PATTERN: Large Multi-Statement Transactions
+
+```sql
+-- ❌ WRONG — 20+ statements can accumulate toward 16MB limit
+BEGIN;
+INSERT INTO audit_log VALUES (...);  -- 200KB
+INSERT INTO audit_log VALUES (...);  -- 200KB
+-- ... 20 more inserts ...
+COMMIT;
+```
+
+### ✅ Correct: Chunk Large Transactions
+
+- Keep transactions SHORT: **<10 statements, <4MB total payload**
+- Keep individual rows under **1MB**
+- Chunk large documents into **64–256KB** pieces
+- Store blobs >1MB in object storage (S3/GCS) with a DB reference
+- Commit every 5–10 statements in batch operations
+- Separate audit/logging writes from business logic transactions
+
+> **Note:** Exceeding these limits can cause `split failed while applying backpressure to Put` errors — large Raft proposals block consensus, range splits stall, and the system applies backpressure.
+
+---
+
+## 6. Online Schema Changes (DDL)
+
+In PostgreSQL, DDL is transactional. **In CockroachDB, schema changes run as background JOBS.** This has critical implications.
+
+### ⛔ ANTI-PATTERN: Multiple DDL in a Transaction
+
+```sql
+-- ❌ WRONG — CockroachDB does NOT support atomic multi-DDL transactions
+BEGIN;
+ALTER TABLE users ADD COLUMN email_verified BOOL DEFAULT false;
+CREATE INDEX idx_users_email ON users(email);
+COMMIT;
+-- Risk: first DDL may succeed, second may fail = inconsistent schema
+```
+
+### ✅ Correct: One DDL per Implicit Transaction
+
+```sql
+-- ✅ Each DDL runs as its own implicit transaction (no BEGIN/COMMIT)
+ALTER TABLE users ADD COLUMN email_verified BOOL DEFAULT false;
+-- Wait for SHOW JOBS to confirm completion, then:
+CREATE INDEX idx_users_email ON users(email);
+```
+
+### ORM/Migration Tool Compatibility
+
+For ORMs and migration tools (Flyway, Liquibase, Rails migrations) that wrap DDL in transactions:
+
+```sql
+-- Enable this session variable to auto-commit before DDL
+SET autocommit_before_ddl = on;
+```
+
+### ⛔ ANTI-PATTERN: `SELECT *` in Prepared Statements
+
+```java
+// ❌ WRONG — cached plan breaks when schema changes (column added/removed)
+PreparedStatement ps = conn.prepareStatement("SELECT * FROM users WHERE id = ?");
+```
+
+```java
+// ✅ CORRECT — explicit column list survives schema changes
+PreparedStatement ps = conn.prepareStatement(
+    "SELECT id, name, email, created_at FROM users WHERE id = ?");
+```
+
+### DDL Best Practices
+
+- **One DDL per migration step** in Flyway/Liquibase
+- Monitor schema change progress: `SHOW JOBS WHERE job_type = 'SCHEMA CHANGE'`
+- Run large backfill schema changes during off-peak hours
+- Never mix reads, writes, and DDL in the same transaction
+
+---
+
+## 7. Primary Key Design
+
+### ⛔ ANTI-PATTERN: SERIAL / Auto-Increment Primary Keys
+
+```sql
+-- ❌ WRONG — creates write hotspot on last range, one node does all work
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    ...
+);
+```
+
+Sequential IDs route **all** inserts to the same range on the same leaseholder node. That node shows 80–90% CPU while others idle at 10–20%. You're paying for N nodes but getting 1 node's throughput.
+
+### ✅ Correct: UUID Primary Keys
+
+```sql
+-- ✅ Writes distribute uniformly across all nodes
+CREATE TABLE orders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id UUID NOT NULL,
+    amount DECIMAL(10,2) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### ✅ When You Need Sequential Ordering: Hash-Sharded Indexes
+
+```sql
+-- ✅ Keeps time ordering but distributes writes across hash buckets
+CREATE TABLE events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_time TIMESTAMPTZ NOT NULL DEFAULT now(),
+    payload JSONB,
+    INDEX idx_events_time (event_time) USING HASH WITH (bucket_count = 8)
+);
+```
+
+### ✅ Composite Primary Keys for Multi-Tenant
+
+```sql
+-- ✅ Well-distributed first column + natural data co-location
+CREATE TABLE orders (
+    tenant_id UUID NOT NULL,
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    amount DECIMAL(10,2) NOT NULL,
+    PRIMARY KEY (tenant_id, id)
+);
+```
+
+---
+
+## 8. ORM Configuration
+
+Always use the CockroachDB-specific adapter/dialect when available. Using the PostgreSQL adapter directly **will cause issues** with transaction retries, DDL handling, and data type mapping.
+
+| Framework | Correct Configuration |
+|-----------|----------------------|
+| **Django** | `django-cockroachdb` backend — **NOT** `django.db.backends.postgresql` |
+| **SQLAlchemy** | `cockroachdb://` dialect with `sqlalchemy-cockroachdb` package |
+| **ActiveRecord (Rails)** | `activerecord-cockroachdb-adapter` gem |
+| **Prisma** | `cockroachdb` as the `provider` in `schema.prisma` |
+| **TypeORM** | `cockroachdb` as the database `type` in DataSource options |
+| **GORM (Go)** | `gorm.io/driver/postgres` (works via pgwire compatibility) |
+| **Hibernate / Spring** | Standard PostgreSQL JDBC driver + `cockroachdb-jdbc-wrapper` for retries |
+| **JOOQ** | `SQLDialect.COCKROACHDB` (v3.18+) |
+| **Sequelize** | `cockroachdb` dialect (via `sequelize-cockroachdb`) |
+
+### Django Example
+
+```python
+# settings.py
+DATABASES = {
+    'default': {
+        'ENGINE': 'django_cockroachdb',  # NOT django.db.backends.postgresql
+        'NAME': 'mydb',
+        'HOST': 'localhost',
+        'PORT': '26257',
+        'USER': 'root',
+    }
+}
+```
+
+### Prisma Example
+
+```prisma
+// schema.prisma
+datasource db {
+  provider = "cockroachdb"  // NOT "postgresql"
+  url      = env("DATABASE_URL")
+}
+```
+
+---
+
+## 9. Connection Management
+
+### Connection String Format
+
+```bash
+# CockroachDB Cloud (Serverless / Dedicated)
+postgresql://<user>:<password>@<host>:26257/<database>?sslmode=verify-full
+
+# Self-Hosted with TLS
+postgresql://<user>:<password>@<host>:26257/<database>?sslmode=verify-full&sslrootcert=/path/to/ca.crt
+
+# Local Development (insecure)
+postgresql://root@localhost:26257/<database>?sslmode=disable
+```
+
+### Connection Pooling
+
+| Setting | Recommendation |
+|---------|---------------|
+| Pool size | `4 × vCPUs` per application instance |
+| Max connections per node | 100 (CockroachDB Cloud default) |
+| Idle timeout | 5–10 minutes |
+| Max lifetime | 30 minutes (rotate connections) |
+| Validation query | `SELECT 1` |
+
+### ⛔ ANTI-PATTERN: No Connection Validation
+
+```java
+// ❌ WRONG — stale connections after node restarts/drains
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl("jdbc:postgresql://...");
+```
+
+```java
+// ✅ CORRECT — validate connections and set proper timeouts
+HikariConfig config = new HikariConfig();
+config.setJdbcUrl("jdbc:postgresql://...");
+config.setMaximumPoolSize(4 * Runtime.getRuntime().availableProcessors());
+config.setConnectionTimeout(10_000);      // 10s to acquire connection
+config.setIdleTimeout(300_000);           // 5min idle before eviction
+config.setMaxLifetime(1_800_000);         // 30min max lifetime
+config.setConnectionTestQuery("SELECT 1");
+config.setKeepaliveTime(60_000);          // 1min keepalive
+```
+
+### Always Use `sslmode=verify-full` in Production
+
+- CockroachDB Cloud **requires** TLS
+- Self-hosted: generate certs with `cockroach cert`
+- Never use `sslmode=disable` outside local development
+
+---
+
+## 10. Read-Write Splitting with `AS OF SYSTEM TIME`
+
+For read-heavy workloads that can tolerate slight staleness, use follower reads to reduce contention and latency:
+
+```sql
+-- Read from nearest replica (10s staleness), no write locks acquired
+SELECT * FROM products WHERE category = 'electronics'
+  AS OF SYSTEM TIME '-10s';
+
+-- Use with_min_timestamp for bounded staleness (auto-routes to nearest replica)
+SELECT * FROM products WHERE category = 'electronics'
+  AS OF SYSTEM TIME with_min_timestamp(now() - '10s');
+```
+
+### When to Use
+
+- Dashboards and analytics queries
+- Reporting and aggregation
+- Search/browse operations
+- Any read that doesn't need real-time data
+
+### When NOT to Use
+
+- Immediately after a write that the user expects to see
+- In the same transaction as writes
+- For financial balances or inventory checks that must be exact
+
+---
+
+## 11. Prepared Statement Best Practices
+
+- **Always use parameterized queries** — prevents SQL injection, enables plan caching
+- **Always list explicit columns** — never `SELECT *` (cached plans break on schema changes)
+- **Close statements when done** — prevents resource leaks on CockroachDB nodes
+
+```go
+// ✅ CORRECT — parameterized, explicit columns
+rows, err := db.QueryContext(ctx,
+    "SELECT id, name, email FROM users WHERE tenant_id = $1 AND active = true",
+    tenantID)
+```
+
+---
+
+## 12. Error Handling Summary
+
+| Error Type | SQLSTATE | Retry? | Action |
+|-----------|----------|--------|--------|
+| Serialization failure | `40001` | ✅ Yes | Retry entire transaction with backoff |
+| Connection errors | `08xxx` | ✅ Yes | Retry with new connection |
+| Admin shutdown | `57P01` | ✅ Yes | Retry with backoff (node draining) |
+| Duplicate key | `23505` | ❌ No | Application logic error — fix the INSERT |
+| Foreign key violation | `23503` | ❌ No | Referenced row doesn't exist — fix data |
+| Check constraint | `23514` | ❌ No | Data doesn't meet constraint — fix data |
+| Syntax error | `42601` | ❌ No | Fix the SQL |
+| Undefined table | `42P01` | ❌ No | Table doesn't exist — check schema |
+| Transaction too large | N/A | ❌ No | Chunk into smaller transactions |
+
+---
+
+## 13. Consolidated Bad SQL & Application Patterns
+
+| # | Bad Pattern | Why It's Bad | Fix |
+|---|------------|--------------|-----|
+| 1 | SAVEPOINT + ROLLBACK TO SAVEPOINT as retry | 40001 aborts entire txn, not fixable | Full-transaction retry loop |
+| 2 | Read-modify-write on hot rows without retry | 40001 errors, lost updates | Use RetryableExecutor or crdb.ExecuteTx |
+| 3 | SELECT large JSON + UPDATE in same txn | Long txn, idle time, contention | Read-write split with AS OF SYSTEM TIME |
+| 4 | Row-by-row INSERT in a loop (N+1) | N round trips, ~50% idle time | addBatch/executeBatch |
+| 5 | SELECT * without WHERE or LIMIT | Full table scan, blocks other txns | Always use WHERE + LIMIT |
+| 6 | UPDATE without WHERE clause | Bulk write, exceeds row limits | Add WHERE, set session guardrails |
+| 7 | 20+ statements in one txn (KB each) | Accumulates toward 16MB limit | Commit every 5–10 statements |
+| 8 | Storing multi-MB blobs inline | Slow Raft, range split backpressure | Object storage (S3/GCS) + DB reference |
+| 9 | SERIAL/SEQUENCE primary keys | Write hotspot, one node CPU spike | UUID with gen_random_uuid() |
+| 10 | Multiple DDL in BEGIN/COMMIT | Not atomic, partial commit risk | One DDL per implicit transaction |
+| 11 | SELECT * in prepared statements | Schema change breaks cached plan | Explicit column lists |
+| 12 | No retry logic for 40001 | Silent data loss, failed transactions | Mandatory retry wrapper |
+| 13 | Fixed-delay retries (no jitter) | Thundering herd on retry | Exponential backoff with random jitter |
+| 14 | Retrying non-retryable errors | Wasted resources, infinite loops | Check SQLSTATE before retrying |
+| 15 | Using PostgreSQL ORM backend | Missing retry support, DDL issues | Use CockroachDB-specific adapter |
+| 16 | More threads on hot rows | Lower TPS, more 40001 waste | Redesign schema to avoid hot rows |
+| 17 | sslmode=disable in production | No encryption, MITM vulnerable | Always sslmode=verify-full |
+| 18 | No connection pool validation | Stale connections after node drain | Set connectionTestQuery + keepalive |
+| 19 | Mixing DDL with DML in transactions | Deadlocks, partial schema changes | Separate DDL from DML completely |
+| 20 | No session guardrails in dev/test | Runaway queries hit production | Set transaction_rows_read/written_err |
+
+---
+
+## 14. General Rules (Quick Reference)
+
+1. **Keep transactions SHORT** — <10 statements, <4MB total payload
+2. **Keep rows SMALL** — <1MB per row; use chunking or object storage for large data
+3. **Use UUID primary keys** — `gen_random_uuid()`, never SERIAL
+4. **Transaction retry is MANDATORY** — wrap every write transaction in a retry loop
+5. **Use exponential backoff with jitter** — not fixed delays
+6. **Use `AS OF SYSTEM TIME`** for read-heavy operations outside write transactions
+7. **Use batching** — `addBatch`/`executeBatch` instead of row-by-row loops
+8. **One DDL per implicit transaction** — no BEGIN/COMMIT wrapping
+9. **Always list explicit columns** — no `SELECT *` in prepared statements or application code
+10. **Set session guardrails** in dev/test — `transaction_rows_read_err`, `transaction_rows_written_err`
+11. **Use CockroachDB ORM adapters** — not raw PostgreSQL backends
+12. **Always `sslmode=verify-full`** in production
+13. **Set `autocommit_before_ddl = on`** when using ORM migration tools
+14. **Monitor** — `SHOW JOBS` for schema changes, DB Console for contention

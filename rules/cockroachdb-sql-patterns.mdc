@@ -1,0 +1,676 @@
+---
+description: CockroachDB SQL best practices, anti-patterns, and distributed database patterns. These rules MUST be followed when writing SQL, schema definitions, or application code that interacts with CockroachDB. Covers 24 verified best practices from production workloads.
+globs:
+  - "**/*.sql"
+  - "**/*.go"
+  - "**/*.py"
+  - "**/*.js"
+  - "**/*.ts"
+  - "**/*.java"
+  - "**/*.rb"
+  - "**/*.rs"
+  - "**/*.cs"
+  - "**/*.kt"
+  - "**/*.prisma"
+---
+
+# CockroachDB SQL Best Practices & Anti-Patterns
+
+> 24 production-verified best practices for CockroachDB.
+> Each section marks anti-patterns with ❌ NEVER and correct patterns with ✅ ALWAYS.
+> Docs: https://www.cockroachlabs.com/docs/stable/
+
+---
+
+## 1. Primary Keys — Avoid Sequential Hotspots
+
+CockroachDB distributes data across ranges sorted by primary key. Sequential keys concentrate ALL inserts into a single range on a single node, creating a write hotspot.
+
+**❌ NEVER: Use SERIAL, BIGSERIAL, or auto-increment as a single-column primary key**
+
+```sql
+-- BAD: All inserts land on ONE node. CPU skew: one node at 80-90%, others at 10-20%.
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,  -- HOTSPOT! unique_rowid() is monotonically increasing
+    customer_id UUID,
+    amount DECIMAL
+);
+```
+
+**✅ ALWAYS: Use UUID with `gen_random_uuid()` for most tables**
+
+```sql
+-- GOOD: Writes distribute evenly across all nodes
+CREATE TABLE orders (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    customer_id UUID NOT NULL,
+    amount DECIMAL(15,2) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+**✅ Use hash-sharded indexes when time ordering is required**
+
+```sql
+-- GOOD: Distributes sequential timestamps across 8 buckets
+CREATE TABLE audit_events (
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    event_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    event_type STRING NOT NULL,
+    payload JSONB,
+    PRIMARY KEY (created_at, event_id) USING HASH WITH (bucket_count = 8)
+);
+```
+
+**✅ Use composite primary keys for multi-tenant or regional data**
+
+```sql
+-- GOOD: Data co-located by tenant for fast reads, distributed across tenants
+CREATE TABLE tenant_data (
+    tenant_id UUID NOT NULL,
+    record_id UUID NOT NULL DEFAULT gen_random_uuid(),
+    data JSONB,
+    PRIMARY KEY (tenant_id, record_id)
+);
+```
+
+**Why one DB node has elevated CPU:** SERIAL PKs route ALL inserts to the last range, which lives on one leaseholder node. That node shows 80-90% CPU while others idle at 10-20%. You're paying for 5 nodes but getting 1 node's throughput. Diagnosis: check the Hot Ranges page and Hardware dashboard in DB Console.
+
+To enforce explicit PKs cluster-wide:
+
+```sql
+SET CLUSTER SETTING sql.defaults.require_explicit_primary_keys.enabled = true;
+```
+
+> Docs: https://www.cockroachlabs.com/docs/stable/schema-design-table#primary-key-best-practices
+
+---
+
+## 2. Transaction Retry — Full-Transaction Retry is the ONLY Correct Approach
+
+CockroachDB uses SERIALIZABLE isolation (strongest level) with optimistic concurrency. When two transactions touch the same row, one is aborted with SQLSTATE 40001. The application MUST retry the **entire** transaction.
+
+**❌ NEVER: Use SAVEPOINT-based retry**
+
+```sql
+-- BAD: CockroachDB aborts the ENTIRE transaction on 40001.
+-- SAVEPOINT rollback CANNOT fix it. The transaction stays in ABORTED state.
+BEGIN;
+SAVEPOINT before_op;
+UPDATE accounts SET balance = balance - 500 WHERE account_id = $1;
+-- 40001 error here...
+ROLLBACK TO SAVEPOINT before_op;  -- DOES NOT WORK! Transaction is dead.
+COMMIT;                           -- FAILS with "current transaction is aborted"
+```
+
+**✅ ALWAYS: Wrap the entire BEGIN..COMMIT in a retry loop with exponential backoff + jitter**
+
+```python
+# Python example — retry pattern
+import psycopg2
+import random
+import time
+
+def execute_with_retry(conn_params, operation, max_retries=5):
+    for attempt in range(max_retries):
+        conn = psycopg2.connect(**conn_params)
+        try:
+            conn.autocommit = False
+            operation(conn)
+            conn.commit()
+            return  # success
+        except psycopg2.errors.SerializationFailure:  # SQLSTATE 40001
+            conn.rollback()
+            sleep_ms = min(200 * (2 ** attempt), 5000)  # exponential
+            sleep_ms *= (0.5 + random.random())          # jitter
+            time.sleep(sleep_ms / 1000)
+        except Exception:
+            conn.rollback()
+            raise  # DO NOT retry non-retryable errors
+        finally:
+            conn.close()
+    raise Exception("Transaction failed after max retries")
+```
+
+```go
+// Go — use the official CockroachDB retry library
+import "github.com/cockroachdb/cockroach-go/v2/crdb"
+
+err := crdb.ExecuteTx(ctx, db, nil, func(tx *sql.Tx) error {
+    // Your entire transaction logic here
+    _, err := tx.Exec("UPDATE accounts SET balance = balance - $1 WHERE id = $2", amount, id)
+    return err
+})
+```
+
+```java
+// Java — use cockroachdb-jdbc-wrapper with Resilience4j
+// Handles 40001 (serialization), 08xxx (connection), 57P01 (admin shutdown)
+// Default: 5 attempts, 200ms base, 2x multiplier, 0.5 jitter factor
+RetryableExecutor executor = new RetryableExecutor();
+executor.executeVoid(() -> {
+    try (Connection conn = ds.getConnection()) {
+        conn.setAutoCommit(false);
+        // ... your SQL ...
+        conn.commit();
+    } catch (SQLException e) {
+        throw new RuntimeException(e);
+    }
+});
+```
+
+**Retryable SQLSTATE codes:**
+- `40001` — Serialization failure (transaction conflict). ALWAYS retry.
+- `08xxx` — Connection errors (network, node restart). Retry with new connection.
+- `57P01` — Admin shutdown (rolling restart, node drain). Retry with new connection.
+
+> Docs: https://www.cockroachlabs.com/docs/stable/transaction-retry-error-reference
+
+---
+
+## 3. Contention — More Threads on Hot Rows = LOWER Throughput
+
+**❌ NEVER: Scale concurrency on hot-row workloads expecting higher throughput**
+
+With N concurrent writers on the same row:
+- Only 1 can commit per "round" (the winner)
+- The other N-1 are aborted with 40001 and must retry
+- Wasted work = (N-1)/N of all attempts
+- 5 threads: ~80% waste → 20 threads: ~95% waste
+- **TPS goes DOWN as you add more pods/threads**
+
+**✅ ALWAYS: Eliminate the hot row or reduce contention**
+
+```sql
+-- GOOD: Atomic single-statement update — no read-modify-write contention
+UPDATE accounts SET balance = balance + 75.00 WHERE account_id = $1;
+
+-- GOOD: Use SELECT FOR UPDATE to serialize access explicitly
+BEGIN;
+SELECT balance FROM accounts WHERE account_id = $1 FOR UPDATE;
+UPDATE accounts SET balance = $new_balance WHERE account_id = $1;
+COMMIT;
+```
+
+Other solutions for hot-row workloads:
+- **Shard the account** across multiple rows (e.g., balance sharding)
+- **Queue and batch** — collect writes, apply in periodic single-writer batch
+- **Reduce transaction scope** — fewer statements = shorter conflict window
+
+> Docs: https://www.cockroachlabs.com/docs/stable/performance-best-practices-overview#transaction-contention
+
+---
+
+## 4. Read-Write Splitting with AS OF SYSTEM TIME
+
+**❌ NEVER: Read large payloads and write in the same transaction**
+
+```sql
+-- BAD: Transaction holds write intents during heavy read + app processing.
+-- Increases duration, idle time, and 40001 probability.
+BEGIN;
+SELECT payload FROM documents WHERE doc_id = $1;  -- 500KB JSON
+-- ... app processes the JSON for 200ms ...
+UPDATE documents SET status = 'APPROVED' WHERE doc_id = $1;
+COMMIT;
+```
+
+**✅ ALWAYS: Split into read → process → short write**
+
+```sql
+-- Phase 1: Conflict-free historical read (no write intents held)
+SELECT payload FROM documents AS OF SYSTEM TIME '-10s' WHERE doc_id = $1;
+
+-- Phase 2: Process in application (parse JSON, compute, decide)
+
+-- Phase 3: Short write-only transaction
+BEGIN;
+UPDATE documents SET status = 'APPROVED', updated_at = now() WHERE doc_id = $1;
+COMMIT;
+```
+
+`AS OF SYSTEM TIME` reads serve from the nearest replica (follower reads) — this reduces latency in multi-region deployments and eliminates read-write conflicts entirely.
+
+---
+
+## 5. Batch Operations — Eliminate the N+1 Anti-Pattern
+
+**❌ NEVER: Insert/update rows one at a time in a loop**
+
+```sql
+-- BAD: 500 network round trips. ~50% of transaction latency is idle/round-trip overhead.
+FOR each row:
+    INSERT INTO accounts (id, name, balance) VALUES (gen_random_uuid(), $name, $balance);
+```
+
+**✅ ALWAYS: Use batch operations or multi-row INSERT**
+
+```sql
+-- GOOD: Multi-row INSERT (1 round trip)
+INSERT INTO accounts (id, name, balance) VALUES
+    (gen_random_uuid(), 'Alice', 1000.00),
+    (gen_random_uuid(), 'Bob', 2000.00),
+    (gen_random_uuid(), 'Carol', 3000.00);
+
+-- GOOD: Batch size of 128-256 rows per statement for optimal throughput
+-- GOOD: Use JDBC addBatch/executeBatch, Python executemany, etc.
+```
+
+For batch UPDATEs, use a single statement instead of N statements:
+
+```sql
+-- GOOD: Single-statement batch update
+UPDATE accounts SET balance = CASE account_id
+    WHEN 'uuid-1' THEN 100.00
+    WHEN 'uuid-2' THEN 200.00
+    WHEN 'uuid-3' THEN 300.00
+END WHERE account_id IN ('uuid-1', 'uuid-2', 'uuid-3');
+```
+
+---
+
+## 6. Session Guardrails — Catch Runaway Queries
+
+**✅ ALWAYS: Set session guardrails in development and testing**
+
+```sql
+-- Circuit breakers: abort transactions exceeding these limits
+SET transaction_rows_read_err = 200;      -- catches missing WHERE clauses
+SET transaction_rows_written_err = 1000;  -- catches bulk updates that should be chunked
+
+-- Warning thresholds (log but don't abort)
+SET transaction_rows_read_log = 100;
+SET transaction_rows_written_log = 500;
+```
+
+These catch:
+- `SELECT *` without WHERE or LIMIT inside transactions (full table scans)
+- `UPDATE` without WHERE clause (accidentally updating all rows)
+- Queries missing indexes that scan entire tables
+
+Start strict and loosen as you verify queries are optimized.
+
+---
+
+## 7. Transaction Size Limits — 16MB Payload Cap
+
+CockroachDB has a ~16MB limit on **total transaction payload** (not just individual rows). This applies to the SUM of all writes in a single transaction.
+
+**❌ NEVER: Write many KB-sized rows in a single transaction**
+
+```
+-- BAD: 25 statements × 500KB each = 12.5MB. 30 × 600KB = 18MB → EXCEEDS LIMIT
+-- Error: "split failed while applying backpressure to Put"
+BEGIN;
+INSERT INTO audit_log (...) VALUES (...);  -- 500KB
+INSERT INTO audit_log (...) VALUES (...);  -- 500KB
+... × 25 more times ...
+COMMIT;
+```
+
+**✅ ALWAYS: Keep transactions under 4MB total, rows under 1MB**
+
+```sql
+-- GOOD: Commit every 5-10 statements
+-- Batch 1
+BEGIN;
+INSERT INTO audit_log (...) VALUES (...);  -- statements 1-5
+COMMIT;
+-- Batch 2
+BEGIN;
+INSERT INTO audit_log (...) VALUES (...);  -- statements 6-10
+COMMIT;
+```
+
+**Size guidelines:**
+| Target | Limit |
+|--------|-------|
+| Individual row size | < 1 MB |
+| Total transaction payload | < 4 MB |
+| Statements per transaction | < 10 |
+| Large document storage | Object storage (S3/GCS) with DB reference |
+| Document chunking | 64-256 KB per chunk row |
+
+When the 16MB limit is exceeded, `split failed while applying backpressure to Put` occurs because:
+1. Large Raft proposals block consensus on every replica
+2. Range splits stall while large writes are in-flight
+3. LSM compaction falls behind under sustained large writes
+
+> Docs: https://www.cockroachlabs.com/docs/stable/architecture/distribution-layer#range-splits
+
+---
+
+## 8. Indexing Strategies
+
+### 8a. Covering Indexes with STORING
+
+**✅ ALWAYS: Add STORING for columns returned by queries using the index**
+
+```sql
+-- BAD: Requires an "index join" back to the primary index to get name and balance
+CREATE INDEX idx_status ON accounts (status);
+
+-- GOOD: Covering index — all columns served from the secondary index
+CREATE INDEX idx_status ON accounts (status) STORING (customer_name, balance);
+```
+
+`STORING` is CockroachDB's equivalent of PostgreSQL's `INCLUDE`. It embeds non-key columns in the index to avoid a round-trip to the primary index.
+
+### 8b. Partial Indexes
+
+**✅ Use partial indexes for frequently filtered subsets**
+
+```sql
+-- GOOD: Only indexes ACTIVE rows — smaller size, less write amplification
+CREATE INDEX idx_active_accounts ON accounts (customer_name)
+    WHERE status = 'ACTIVE';
+
+-- GOOD: Only indexes pending orders
+CREATE INDEX idx_pending_orders ON orders (created_at)
+    WHERE status = 'PENDING';
+```
+
+### 8c. GIN (Inverted) Indexes on JSONB
+
+**✅ ALWAYS: Add GIN indexes on JSONB columns used in containment queries**
+
+```sql
+-- GOOD: Enables fast @> queries without full-table scans
+CREATE INVERTED INDEX idx_metadata ON accounts (metadata);
+
+-- Now this is fast:
+SELECT * FROM accounts WHERE metadata @> '{"tier": "PLATINUM"}';
+SELECT * FROM accounts WHERE metadata @> '{"tags": ["premium"]}';
+```
+
+### 8d. Computed Columns from JSONB
+
+**✅ Extract frequently queried JSON fields into typed, indexed columns**
+
+```sql
+-- GOOD: Typed column with B-tree index for fast range queries
+ALTER TABLE accounts ADD COLUMN risk_score INT
+    AS ((metadata->>'risk_score')::INT) STORED;
+CREATE INDEX idx_risk_score ON accounts (risk_score);
+
+-- Now range queries are fast:
+SELECT * FROM accounts WHERE risk_score > 80;
+```
+
+### 8e. Expression Indexes
+
+**✅ Use expression indexes when you don't need a stored column**
+
+```sql
+-- GOOD: Index the expression result directly
+CREATE INDEX idx_tier ON accounts ((metadata->>'tier'));
+
+-- Now this uses the index:
+SELECT * FROM accounts WHERE metadata->>'tier' = 'GOLD';
+```
+
+### 8f. Hash-Sharded Indexes for Sequential Keys
+
+**✅ Use hash-sharded indexes when sequential ordering creates hotspots**
+
+```sql
+-- GOOD: Distributes writes across 8 buckets
+CREATE INDEX idx_ts ON events (created_at) USING HASH WITH (bucket_count = 8);
+```
+
+Trade-off: range scans must fan out across all buckets.
+
+### Index Maintenance
+
+```sql
+-- Audit unused indexes (they add write overhead):
+SELECT * FROM crdb_internal.index_usage_statistics WHERE total_reads = 0;
+
+-- Every foreign key column SHOULD have an index
+-- Drop indexes that are never read
+```
+
+> Docs: https://www.cockroachlabs.com/docs/stable/schema-design-indexes#best-practices
+> Hash-sharded: https://www.cockroachlabs.com/docs/stable/hash-sharded-indexes
+> Partial: https://www.cockroachlabs.com/docs/stable/partial-indexes
+> GIN: https://www.cockroachlabs.com/docs/stable/inverted-indexes
+
+---
+
+## 9. Online Schema Changes — DDL Is NOT Transactional
+
+In CockroachDB, schema changes run as **background jobs**, not inline DDL like PostgreSQL.
+
+**❌ NEVER: Wrap multiple DDL statements in BEGIN/COMMIT**
+
+```sql
+-- BAD: NOT atomic in CockroachDB! If col_b fails, col_a may already be committed.
+BEGIN;
+ALTER TABLE events ADD COLUMN col_a INT;
+ALTER TABLE events ADD COLUMN col_b INT;
+COMMIT;
+```
+
+**✅ ALWAYS: Run each DDL as its own implicit transaction**
+
+```sql
+-- GOOD: Each DDL runs independently. If one fails, fix and retry it.
+ALTER TABLE events ADD COLUMN col_a INT;
+ALTER TABLE events ADD COLUMN col_b INT;
+CREATE INDEX idx_events_type ON events (event_type);
+```
+
+**Exception:** DDL in the same transaction as `CREATE TABLE` is safe (the table doesn't exist yet):
+
+```sql
+-- OK: All DDL in same transaction as the CREATE TABLE that creates the target
+BEGIN;
+CREATE TABLE new_table (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name STRING);
+ALTER TABLE new_table ADD COLUMN status STRING DEFAULT 'ACTIVE';
+CREATE INDEX idx_name ON new_table (name);
+COMMIT;
+```
+
+**Monitor schema change progress:**
+
+```sql
+SHOW JOBS WHERE job_type = 'SCHEMA CHANGE' ORDER BY created DESC LIMIT 5;
+-- Schema changes on large tables may need 3x storage temporarily
+```
+
+### ORM and Migration Tool Compatibility
+
+**✅ Enable `autocommit_before_ddl` for ORMs that wrap DDL in transactions**
+
+```sql
+-- Per session:
+SET autocommit_before_ddl = on;
+
+-- For all users (permanent):
+ALTER ROLE ALL SET autocommit_before_ddl = on;
+
+-- In JDBC connection string:
+-- jdbc:postgresql://host:26257/db?options=-c autocommit_before_ddl=on
+```
+
+| Tool | Recommendation |
+|------|---------------|
+| Flyway | One DDL per migration file (V1__create_table.sql) |
+| Liquibase | One changeset per DDL operation |
+| Hibernate | Use Flyway/Liquibase for DDL; disable `hibernate.ddl-auto` |
+| Django | Use `--run-syncdb=false`; manage migrations manually |
+
+> Docs: https://www.cockroachlabs.com/docs/stable/online-schema-changes
+
+---
+
+## 10. Prepared Statement Safety
+
+**❌ NEVER: Use SELECT * in prepared statements**
+
+```sql
+-- BAD: Schema changes invalidate cached plans
+-- After ALTER TABLE adds a column, this breaks with:
+-- "cached plan must not change result type"
+PREPARE stmt AS SELECT * FROM accounts;
+```
+
+**✅ ALWAYS: Use explicit column lists**
+
+```sql
+-- GOOD: Survives schema changes
+PREPARE stmt AS SELECT id, name, balance FROM accounts;
+```
+
+This is especially critical when using ORMs or connection pools that cache prepared statements across schema migrations.
+
+---
+
+## 11. Multi-Region Table Localities
+
+CockroachDB is the only SQL database with SQL-level data placement control. No PostgreSQL/Oracle equivalent exists.
+
+| Locality | Best For | Read Latency | Write Latency |
+|----------|----------|-------------|---------------|
+| `REGIONAL BY TABLE` | Data accessed from one primary region | Low in primary | Low in primary |
+| `REGIONAL BY ROW` | Data partitioned by user/region | Low from local region | Low to local region |
+| `GLOBAL` | Reference data read everywhere | Low everywhere | High (all regions agree) |
+
+```sql
+-- Set up regions
+ALTER DATABASE mydb PRIMARY REGION 'us-east-1';
+ALTER DATABASE mydb ADD REGION 'us-west-2';
+ALTER DATABASE mydb ADD REGION 'eu-west-1';
+
+-- Survival goal: survive entire region failure (requires 3+ regions)
+ALTER DATABASE mydb SURVIVE REGION FAILURE;
+
+-- Reference/config tables: fast reads everywhere
+ALTER TABLE countries SET LOCALITY GLOBAL;
+
+-- Per-user data: each row in its region
+ALTER TABLE user_profiles SET LOCALITY REGIONAL BY ROW;
+
+-- Regional operations data (default)
+ALTER TABLE transactions SET LOCALITY REGIONAL BY TABLE IN PRIMARY REGION;
+```
+
+For `REGIONAL BY ROW` tables, filter by `crdb_region` for locality-optimized reads:
+
+```sql
+-- GOOD: Reads served from local replica
+SELECT * FROM user_profiles WHERE crdb_region = 'us-east-1' AND user_id = $1;
+```
+
+> Docs: https://www.cockroachlabs.com/docs/stable/multiregion-overview
+
+---
+
+## 12. CockroachDB vs PostgreSQL Compatibility
+
+| PostgreSQL | CockroachDB Equivalent |
+|-----------|----------------------|
+| `uuid_generate_v4()` | `gen_random_uuid()` (built-in, no extension) |
+| `SERIAL` / `BIGSERIAL` | `UUID DEFAULT gen_random_uuid()` (SERIAL works but creates hotspots) |
+| `LISTEN` / `NOTIFY` | Changefeeds (`CREATE CHANGEFEED FOR TABLE ...`) |
+| Advisory locks | Explicit locking or app-level coordination |
+| `pg_trgm` extension | `ILIKE` or full-text search with `to_tsvector`/`to_tsquery` |
+| PostGIS | Built-in spatial types (`GEOMETRY`, `GEOGRAPHY`) |
+| Transactional DDL | Background jobs (one DDL per implicit transaction) |
+| `PL/pgSQL` | Supported with some limitations for UDFs/stored procs |
+| Temp tables | Supported with `SET experimental_enable_temp_tables = 'on'` |
+| `COPY FROM` | Supported for data import |
+| `EXPLAIN` format | CockroachDB uses its own plan format |
+
+---
+
+## 13. Query Patterns
+
+```sql
+-- ✅ ALWAYS use LIMIT on exploratory queries
+SELECT * FROM large_table LIMIT 100;
+
+-- ✅ Prefer UPSERT over INSERT ... ON CONFLICT when replacing entire rows
+UPSERT INTO accounts (id, name, balance) VALUES ($1, $2, $3);
+
+-- ✅ Use RETURNING to avoid a separate SELECT after writes
+INSERT INTO orders (customer_id, amount)
+VALUES ($1, $2) RETURNING order_id, created_at;
+
+-- ✅ Use AS OF SYSTEM TIME for follower reads (multi-region latency reduction)
+SELECT * FROM accounts AS OF SYSTEM TIME '-10s' WHERE region = 'us-east-1';
+
+-- ✅ Use IMPORT or COPY for bulk data loading (not row-by-row INSERT)
+-- ✅ Avoid SELECT * — specify only needed columns
+-- ✅ Use CTEs (WITH clauses) — they are supported and optimized
+-- ✅ Window functions are fully supported
+```
+
+---
+
+## 14. Connection Best Practices
+
+```sql
+-- ✅ ALWAYS use sslmode=verify-full for CockroachDB Cloud
+-- postgresql://user:pass@host:26257/db?sslmode=verify-full
+
+-- ✅ Connection pool sizing: 4 × number_of_cpus per application instance
+-- ✅ Idle timeout: 5-10 minutes
+-- ✅ Max lifetime: 30 minutes (rotate connections)
+-- ✅ CockroachDB Cloud Serverless includes built-in connection pooling
+-- ✅ For Dedicated/Self-Hosted: use PgBouncer in transaction mode or driver-level pooling
+```
+
+---
+
+## 15. EXPLAIN for Performance Analysis
+
+```sql
+-- Basic plan (no execution)
+EXPLAIN SELECT * FROM orders WHERE customer_id = $1;
+
+-- Actual execution with timing and row counts
+EXPLAIN ANALYZE SELECT * FROM orders WHERE customer_id = $1;
+
+-- Verbose with column details
+EXPLAIN (VERBOSE) SELECT * FROM orders WHERE customer_id = $1;
+
+-- Distributed execution plan across nodes
+EXPLAIN (DISTSQL) SELECT * FROM orders WHERE customer_id = $1;
+```
+
+**Red flags in EXPLAIN output:**
+| Pattern | Problem | Fix |
+|---------|---------|-----|
+| `scan` without index | Full table scan | Add an index on the filter column |
+| `filter` after `scan` | Post-scan filtering | Add index to push filter into scan |
+| `hash join` | May indicate missing index | Add index on join column |
+| `sort` without index | Sort not using index | Add index matching ORDER BY |
+
+**Good patterns:**
+- `lookup join` — using index for join
+- `merge join` — both sides ordered
+- `constrained scan` — index limiting scan range
+
+> Docs: https://www.cockroachlabs.com/docs/stable/performance-recipes#hot-ranges
+
+---
+
+## Consolidated Anti-Pattern Quick Reference
+
+| ❌ Anti-Pattern | Why It's Dangerous | ✅ Fix |
+|---|---|---|
+| SERIAL / SEQUENCE primary keys | Write hotspot on one node, CPU skew | UUID with `gen_random_uuid()` |
+| SAVEPOINT-based retry on 40001 | CockroachDB aborts entire txn | Full-transaction retry loop |
+| Adding threads to hot-row workloads | More retries = lower TPS | Eliminate hot row or shard |
+| Read + write in same long transaction | Holds write intents, increases 40001 | AS OF SYSTEM TIME read → short write |
+| Row-by-row INSERT/UPDATE loop (N+1) | N round trips, ~50% idle time | Batch or multi-row statements |
+| SELECT * without WHERE/LIMIT in txn | Full table scan, blocks other txns | Add WHERE + LIMIT + indexes |
+| 20+ statements in one transaction | Accumulates toward 16MB limit | Commit every 5-10 statements |
+| Storing multi-MB JSON/blobs inline | Slow Raft, range split backpressure | Object storage + DB reference |
+| Multiple DDL in BEGIN/COMMIT | Not atomic, partial commit risk | One DDL per implicit transaction |
+| SELECT * in prepared statements | Schema changes break cached plans | Explicit column lists always |
+| Missing STORING on secondary indexes | Index join penalty (extra round trip) | Add STORING for returned columns |
+| No GIN index on queried JSONB column | Full-table scan on every JSON query | CREATE INVERTED INDEX |
+| Missing retry logic for 40001 | Lost transactions under contention | Retry with exponential backoff + jitter |
+| No session guardrails in dev/test | Runaway queries go undetected | SET transaction_rows_read/written_err |
