@@ -1,0 +1,455 @@
+---
+description: Advanced CockroachDB application development patterns for JPA/Hibernate, Spring, JavaEE, and set-based SQL. Covers JPA identity generators, Spring AOP transaction retry, JavaEE BMT/CMT retry interceptors, CTE-based set operations, Hibernate batch configuration, entity mapping optimization, and query parallelism for bulk operations. Complements cockroachdb-app-patterns (general retry/ORM/connection) with framework-specific depth.
+globs:
+  - "**/*.java"
+  - "**/*.kt"
+  - "**/*.scala"
+  - "**/*.xml"
+  - "**/pom.xml"
+  - "**/build.gradle"
+  - "**/build.gradle.kts"
+  - "**/application.yml"
+  - "**/application.yaml"
+  - "**/application.properties"
+  - "**/persistence.xml"
+  - "**/hibernate.cfg.xml"
+---
+
+# CockroachDB Developer Patterns — JPA, Spring, JavaEE & Set-Based SQL
+
+> Framework-specific patterns from [JPA Best Practices for CockroachDB](https://blog.cloudneutral.se/series/jpa-and-crdb), [Transaction Retries Series](https://blog.cloudneutral.se/series/transaction-retries), [Set-Based Operations](https://andrewdeally.medium.com/set-based-operations-with-cockroachdb-c9f371992dc7), and [cockroachdb-best-practices-demo](https://github.com/viragtripathi/cockroachdb-best-practices-demo).
+
+---
+
+## 1. JPA/Hibernate Identity Generators
+
+**❌ NEVER: Use `GenerationType.IDENTITY` with CockroachDB**
+
+```java
+// BAD: IDENTITY disables Hibernate JDBC batching entirely.
+// Hibernate must execute each INSERT individually to retrieve the generated ID.
+@Id
+@GeneratedValue(strategy = GenerationType.IDENTITY)
+private Long id;
+```
+
+**✅ ALWAYS: Use UUID with `GenerationType.AUTO`**
+
+```java
+// GOOD: UUIDv4 generated in JVM — no DB round-trip, batching works, writes distributed
+@Id
+@GeneratedValue(strategy = GenerationType.AUTO)
+@Column(columnDefinition = "UUID")
+private UUID id;
+```
+
+**✅ Alternative: Explicit UUID generator for clarity**
+
+```java
+@Id
+@GeneratedValue
+@GenericGenerator(name = "uuid", strategy = "org.hibernate.id.UUIDGenerator")
+@Column(columnDefinition = "UUID")
+private UUID id;
+```
+
+**If numeric PKs are unavoidable:**
+
+```java
+// Use unordered_unique_rowid() from CockroachDB — randomly distributed, not sequential
+// Or use a custom generator that batches Hi-Lo allocation from a sequence in the JVM
+@Id
+@GeneratedValue(strategy = GenerationType.SEQUENCE, generator = "order_seq")
+@SequenceGenerator(name = "order_seq", allocationSize = 50)  // batch 50 IDs
+private Long id;
+// WARNING: Still creates some hot-spotting. UUID is strongly preferred.
+```
+
+---
+
+## 2. Spring Boot Transaction Retry with AOP
+
+The standard `@Transactional` annotation does NOT retry on 40001. Add an AOP aspect to intercept and retry.
+
+**✅ CORRECT: Spring AOP retry interceptor**
+
+```java
+@Aspect
+@Order(Ordered.HIGHEST_PRECEDENCE)  // Must run BEFORE @Transactional proxy
+@Component
+public class CockroachRetryAspect {
+    private static final int MAX_RETRIES = 5;
+
+    @Around("@annotation(transactional)")
+    public Object retryOnSerializationFailure(
+            ProceedingJoinPoint pjp, Transactional transactional) throws Throwable {
+        for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+            try {
+                return pjp.proceed();
+            } catch (TransientDataAccessException ex) {
+                Throwable root = ex.getMostSpecificCause();
+                if (root instanceof SQLException sql
+                        && "40001".equals(sql.getSQLState())
+                        && attempt < MAX_RETRIES) {
+                    long backoff = Math.min(
+                        (long)(Math.pow(2, attempt) * 200 + Math.random() * 1000), 15000);
+                    Thread.sleep(backoff);
+                    continue;
+                }
+                throw ex;
+            }
+        }
+        throw new ConcurrencyFailureException("Max retries exceeded for CockroachDB txn");
+    }
+}
+```
+
+**Key:** `@Order(HIGHEST_PRECEDENCE)` ensures the retry aspect wraps OUTSIDE the `@Transactional` proxy, so each retry gets a fresh transaction.
+
+**✅ Alternative: Spring `@Retryable` with spring-retry**
+
+```java
+@Service
+public class TransferService {
+    @Retryable(
+        retryFor = TransientDataAccessException.class,
+        maxAttempts = 5,
+        backoff = @Backoff(delay = 200, multiplier = 2.0, random = true)
+    )
+    @Transactional
+    public void transfer(UUID from, UUID to, BigDecimal amount) {
+        accountRepository.debit(from, amount);
+        accountRepository.credit(to, amount);
+    }
+}
+```
+
+---
+
+## 3. JavaEE/CDI Transaction Retry
+
+### Bean-Managed Transactions (BMT)
+
+```java
+@InterceptorBinding
+@Retention(RUNTIME)
+@Target({METHOD, TYPE})
+public @interface Retryable {}
+
+@Interceptor
+@Retryable
+public class RetryInterceptor {
+    @Inject
+    private TransactionService txService;
+
+    @AroundInvoke
+    public Object retry(InvocationContext ctx) throws Exception {
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            try {
+                return txService.executeInNewTx(() -> ctx.proceed());
+            } catch (Exception e) {
+                if (isRetryable(e) && attempt < 5) {
+                    Thread.sleep((long)(Math.pow(2, attempt) * 200 + Math.random() * 1000));
+                    continue;
+                }
+                throw e;
+            }
+        }
+        throw new RuntimeException("Max retries exceeded");
+    }
+}
+
+@Stateless
+@TransactionManagement(TransactionManagementType.BEAN)
+public class TransactionService {
+    @Resource
+    private UserTransaction utx;
+
+    public Object executeInNewTx(Callable<Object> work) throws Exception {
+        utx.begin();
+        try {
+            Object result = work.call();
+            utx.commit();
+            return result;
+        } catch (Exception e) {
+            utx.rollback();
+            throw e;
+        }
+    }
+}
+```
+
+### Container-Managed Transactions (CMT)
+
+```java
+// The retry interceptor calls a REQUIRES_NEW method, so the container
+// creates a fresh transaction on each attempt.
+@Stateless
+public class AccountService {
+    @Retryable
+    @TransactionAttribute(TransactionAttributeType.NOT_SUPPORTED)
+    public void transfer(UUID from, UUID to, BigDecimal amount) {
+        doTransfer(from, to, amount);  // interceptor wraps this
+    }
+
+    @TransactionAttribute(TransactionAttributeType.REQUIRES_NEW)
+    public void doTransfer(UUID from, UUID to, BigDecimal amount) {
+        // actual DB operations — container manages the transaction
+    }
+}
+```
+
+---
+
+## 4. Set-Based Operations with CTEs
+
+CockroachDB executes CTEs in parallel across nodes. Single-statement CTE transactions get **server-side auto-retry** (implicit transaction) and eliminate all 40001 retries.
+
+**❌ NEVER: Multi-statement explicit transaction for atomic operations**
+
+```sql
+-- BAD: 5+ round trips, holds locks across all statements, 40001-prone
+BEGIN;
+INSERT INTO transaction (id) VALUES (gen_random_uuid()) RETURNING id;
+-- app code captures txn_id
+SELECT balance FROM account WHERE id = 'acc1' FOR UPDATE;
+SELECT balance FROM account WHERE id = 'acc2' FOR UPDATE;
+INSERT INTO transaction_item (...) VALUES (...);
+INSERT INTO transaction_item (...) VALUES (...);
+UPDATE account SET balance = balance - 100 WHERE id = 'acc1';
+UPDATE account SET balance = balance + 100 WHERE id = 'acc2';
+COMMIT;
+```
+
+**✅ ALWAYS: Single-statement CTE (one round-trip, auto-retried)**
+
+```sql
+-- GOOD: One statement, server-side retry, parallel execution across nodes
+-- Benchmark: p99 drops from 4.45s to 0.30s, retries from 0.43 avg to 0.00
+WITH input_data(account_id, amount) AS (
+    VALUES ('acc1'::UUID, -100.00), ('acc2'::UUID, 100.00)
+),
+new_tx AS (
+    INSERT INTO transaction (id) VALUES (gen_random_uuid()) RETURNING id
+),
+locked AS (
+    SELECT a.id, a.balance FROM account a
+    JOIN input_data i ON a.id = i.account_id FOR UPDATE
+),
+items AS (
+    INSERT INTO transaction_item (transaction_id, account_id, amount, running_balance)
+    SELECT (SELECT id FROM new_tx), i.account_id, i.amount, a.balance + i.amount
+    FROM input_data i JOIN locked a ON a.id = i.account_id RETURNING *
+)
+UPDATE account SET balance = balance + i.amount
+FROM input_data i WHERE account.id = i.account_id;
+```
+
+**Set-based bulk delete (replaces N individual DELETEs):**
+
+```sql
+-- GOOD: Delete 999 rows in a single implicit transaction (~30ms vs 1+ second)
+WITH to_delete(id) AS (
+    VALUES ('uuid1'::UUID), ('uuid2'::UUID), ... ('uuid999'::UUID)
+)
+DELETE FROM target_table t USING to_delete d WHERE t.id = d.id;
+```
+
+**Refactoring stored procedures to CTEs:**
+
+```sql
+-- Pass parameters via CTE, chain operations as CTE steps
+WITH vars AS (SELECT 'acc1'::UUID AS from_id, 'acc2'::UUID AS to_id, 100.00 AS amount),
+step1 AS (UPDATE account SET balance = balance - (SELECT amount FROM vars) WHERE id = (SELECT from_id FROM vars) RETURNING *),
+step2 AS (UPDATE account SET balance = balance + (SELECT amount FROM vars) WHERE id = (SELECT to_id FROM vars) RETURNING *)
+SELECT * FROM step1 UNION ALL SELECT * FROM step2;
+```
+
+---
+
+## 5. Hibernate Batch Configuration
+
+**✅ ALWAYS: Configure these properties for CockroachDB**
+
+```properties
+# application.properties (Spring Boot)
+spring.jpa.properties.hibernate.jdbc.batch_size=64
+spring.jpa.properties.hibernate.order_inserts=true
+spring.jpa.properties.hibernate.order_updates=true
+spring.jpa.properties.hibernate.batch_versioned_data=true
+
+# CRITICAL: Rewrites individual INSERTs into multi-row INSERT VALUES
+spring.datasource.hikari.data-source-properties.reWriteBatchedInserts=true
+
+# Prevent Hibernate from acquiring connection just to check autocommit
+spring.jpa.properties.hibernate.connection.provider_disables_autocommit=true
+spring.datasource.hikari.auto-commit=false
+```
+
+**`reWriteBatchedInserts=true`** is the single most impactful setting — it rewrites 64 individual `INSERT INTO t VALUES (...)` into one `INSERT INTO t VALUES (...), (...), ..., (...)`, reducing round-trips by 64x.
+
+---
+
+## 6. Entity Mapping Optimization
+
+**❌ NEVER: Use default eager loading**
+
+```java
+// BAD: Loads ALL orders for every customer query — N+1 problem
+@OneToMany(fetch = FetchType.EAGER)
+private List<Order> orders;
+```
+
+**✅ ALWAYS: Default to LAZY, fetch explicitly when needed**
+
+```java
+// GOOD: Only loads orders when explicitly accessed or JOIN FETCH'd
+@OneToMany(fetch = FetchType.LAZY, mappedBy = "customer")
+private Set<Order> orders;  // Use Set, not List, for @ManyToMany
+
+// In JPQL: load the association when needed
+@Query("SELECT c FROM Customer c JOIN FETCH c.orders WHERE c.id = :id")
+Optional<Customer> findWithOrders(@Param("id") UUID id);
+```
+
+**Additional optimizations:**
+
+```java
+// Use DynamicUpdate for entities with many nullable columns
+@Entity
+@DynamicUpdate  // Only SET columns that actually changed
+@DynamicInsert  // Only INSERT non-null columns
+public class LargeEntity { ... }
+
+// Use getById() (reference proxy) instead of findById() when you only need the FK
+Customer customer = customerRepository.getById(customerId);  // No SELECT issued
+order.setCustomer(customer);  // Sets FK without loading Customer
+
+// Use @Immutable for read-only entities (disables dirty checking)
+@Entity
+@Immutable
+public class AuditLogEntry { ... }
+```
+
+**❌ NEVER: Use Open-Session-In-View (OSIV)**
+
+```properties
+# BAD: Keeps Hibernate session open during HTTP response rendering
+# Causes lazy loading in the view layer = unpredictable N+1 queries
+spring.jpa.open-in-view=true  # ❌ NEVER
+
+# GOOD: Disable OSIV, fetch everything you need in the service layer
+spring.jpa.open-in-view=false  # ✅ ALWAYS
+```
+
+---
+
+## 7. Transaction Scope Management
+
+**❌ NEVER: Call external APIs inside a database transaction**
+
+```java
+// BAD: HTTP call holds the transaction open for 200-2000ms
+@Transactional
+public void processOrder(UUID orderId) {
+    Order order = orderRepo.findById(orderId).orElseThrow();
+    PaymentResult result = paymentGateway.charge(order.getAmount());  // ❌ 200ms HTTP call
+    order.setPaymentId(result.id());
+    order.setStatus("PAID");
+    orderRepo.save(order);
+}
+```
+
+**✅ ALWAYS: Separate external calls from transactions**
+
+```java
+public void processOrder(UUID orderId) {
+    // 1. Read (can use AS OF SYSTEM TIME for staleness-tolerant reads)
+    Order order = orderRepo.findById(orderId).orElseThrow();
+
+    // 2. External call OUTSIDE transaction
+    PaymentResult result = paymentGateway.charge(order.getAmount());
+
+    // 3. Short write transaction
+    updateOrderPayment(orderId, result.id());
+}
+
+@Transactional
+public void updateOrderPayment(UUID orderId, String paymentId) {
+    orderRepo.updatePayment(orderId, paymentId, "PAID");
+}
+```
+
+**Read-only transactions:**
+
+```java
+// For read-only operations, mark as read-only to avoid write overhead
+@Transactional(readOnly = true)
+public List<Order> getRecentOrders(UUID customerId) {
+    return orderRepo.findByCustomerIdOrderByCreatedAtDesc(customerId);
+}
+```
+
+---
+
+## 8. Query Parallelism for Bulk DML
+
+When batch DML exceeds 250K-500K rows:
+
+```java
+// GOOD: Parallel threads on DISJOINTED key ranges (never overlapping)
+// 4 threads on 7M rows: ~2 minutes vs single-threaded timeouts with retries
+
+// Step 1: Read key boundaries in a read-only transaction
+List<UUID> boundaries = jdbcTemplate.queryForList(
+    "SELECT id FROM large_table ORDER BY id", UUID.class);
+
+// Step 2: Partition into N non-overlapping ranges
+List<Range> ranges = partitionIntoRanges(boundaries, 4);
+
+// Step 3: Fan out parallel DML — each thread uses implicit transactions
+ExecutorService pool = Executors.newFixedThreadPool(4);
+ranges.forEach(range -> pool.submit(() -> {
+    jdbcTemplate.update(
+        "DELETE FROM large_table WHERE id >= ? AND id < ?",
+        range.start(), range.end());
+}));
+```
+
+**Rules:**
+- NEVER overlap key ranges between threads (causes 40001 serialization failures)
+- Use implicit transactions per batch (no explicit BEGIN/COMMIT)
+- Run during maintenance windows with sufficient CPU/memory headroom
+- For operations requiring atomicity across tables, use CTE-based set operations instead
+
+---
+
+## 9. Migration from PostgreSQL/Oracle Checklist
+
+| PostgreSQL/Oracle Pattern | CockroachDB Replacement |
+|--------------------------|------------------------|
+| `SERIAL` / `BIGSERIAL` / `AUTO_INCREMENT` | `UUID DEFAULT gen_random_uuid()` |
+| Stored procedures with loops | CTE-based set operations |
+| `FOR UPDATE SKIP LOCKED` (queue pattern) | Retry-based concurrency or partitioned queue |
+| Transactional DDL (multiple ALTERs in BEGIN) | One DDL per implicit transaction |
+| `PL/pgSQL` cursors for row-by-row processing | Set-based CTEs or application-tier batch |
+| Oracle sequences for PK generation | UUID or Hi-Lo batched sequence with allocationSize=50 |
+| `COPY` for bulk load | `IMPORT INTO` for large datasets, `COPY FROM` for moderate |
+| pg_dump for backup | `BACKUP INTO` (CockroachDB native) |
+| Use MOLT tools (Schema Conversion Tool, Fetch, Verify) for migration |
+
+---
+
+## Anti-Pattern Quick Reference (Developer-Specific)
+
+| ❌ Anti-Pattern | Why | ✅ Fix |
+|---|---|---|
+| `@GeneratedValue(IDENTITY)` | Disables Hibernate batching | UUID with `GenerationType.AUTO` |
+| `@Transactional` without retry wrapper | 40001 not retried | Add AOP aspect or `@Retryable` |
+| Multi-statement explicit transaction for atomic ops | Multiple round-trips, 40001-prone | Single-statement CTE |
+| `FetchType.EAGER` on associations | N+1 queries, unbounded data | Default to LAZY, use JOIN FETCH |
+| `spring.jpa.open-in-view=true` (OSIV) | Unpredictable lazy loading | Disable, fetch in service layer |
+| External API call inside `@Transactional` | Transaction held open for seconds | Call API outside transaction |
+| Missing `reWriteBatchedInserts=true` | Each INSERT is separate round-trip | Set on DataSource properties |
+| `hibernate.ddl-auto=update` in production | Wraps DDL in transactions | Use Flyway/Liquibase |
+| Overlapping key ranges in parallel DML | 40001 serialization failures | Partition into disjoint ranges |

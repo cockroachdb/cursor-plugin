@@ -1,0 +1,470 @@
+---
+description: CockroachDB operations, SRE, and runbook patterns. Covers cluster maintenance procedures, monitoring and alerting, diagnostic queries, troubleshooting contention and hardware issues, emergency procedures, backup/restore, version upgrades, changefeed management, capacity planning, and query parallelism for bulk operations. Based on the official CockroachDB runbook template and production operational patterns.
+globs:
+  - "**/*.sql"
+  - "**/*.sh"
+  - "**/*.bash"
+  - "**/*.yaml"
+  - "**/*.yml"
+  - "**/*.toml"
+  - "**/Dockerfile*"
+  - "**/docker-compose*.yml"
+  - "**/docker-compose*.yaml"
+  - "**/*.tf"
+  - "**/*.hcl"
+  - "**/Makefile"
+  - "**/prometheus*.yml"
+  - "**/alertmanager*.yml"
+  - "**/grafana/**"
+---
+
+# CockroachDB Operator & SRE Patterns
+
+> Operational procedures from the [CockroachDB Runbook Template](https://github.com/cockroachlabs/cockroachdb-runbook-template), [Query Parallelism](https://andrewdeally.medium.com/when-and-how-to-use-query-parallelism-with-cockroachdb-df92fbe92845), and [cockroachdb-best-practices-demo](https://github.com/viragtripathi/cockroachdb-best-practices-demo).
+
+---
+
+## 1. Day-1 Operational Readiness
+
+Before operating a CockroachDB cluster, verify this checklist:
+
+| Check | Requirement |
+|-------|-------------|
+| Clock sync | NTP configured on all nodes, `--max-offset` set (default 500ms) |
+| Load balancer | HAProxy or cloud LB in front of all nodes |
+| Connection pooling | Configured per app (4 x vCPUs pool size) |
+| Replication factor | 3 for zone survival, 5 for region survival |
+| Storage | Dedicated SSDs for CockroachDB store directory |
+| One node per OS/container | Never run multiple `cockroach` processes on same host |
+| DBA role | Custom role with appropriate grants (never use `root` in production) |
+| TLS certificates | Generated and distributed; `sslmode=verify-full` enforced |
+| Backup schedule | Automated via `CREATE SCHEDULE FOR BACKUP` |
+| Monitoring | Metrics exported to Prometheus/Datadog/Grafana |
+| Alerting | Alert rules configured per Section 4 thresholds |
+
+**Key terms:**
+- **Node** = one `cockroach` server process (NOT the VM/container)
+- **Cluster** = set of connected CockroachDB nodes forming one system
+- **Range** = ~512MB chunk of data, the unit of replication and distribution
+
+---
+
+## 2. Pre-Check Before Any Maintenance
+
+**✅ ALWAYS: Run these before ANY maintenance operation**
+
+```sql
+-- Verify all nodes are live and available
+SELECT node_id, is_live, is_available FROM crdb_internal.gossip_nodes;
+
+-- Check for running jobs that might conflict
+SELECT job_id, job_type, description, status, fraction_completed
+FROM crdb_internal.jobs WHERE status = 'running';
+
+-- Verify range health
+SELECT count(*) AS total_ranges,
+       count(*) FILTER (WHERE array_length(replicas, 1) < 3) AS under_replicated
+FROM crdb_internal.ranges;
+```
+
+---
+
+## 3. Node Operations
+
+### Start Node
+
+```bash
+cockroach start \
+  --certs-dir=certs \
+  --store=<path> \
+  --listen-addr=<ip>:26257 \
+  --http-addr=<ip>:8080 \
+  --join=<node1>:26257,<node2>:26257,<node3>:26257 \
+  --locality=region=<region>,zone=<zone>
+```
+
+### Stop (Drain) Node Gracefully
+
+```bash
+# Step 1: Drain — moves leases off, finishes in-flight queries
+cockroach node drain <node-id> --certs-dir=certs --host=<ip>:26257
+# Step 2: Wait for drain to complete (monitor output)
+# Step 3: Stop the process
+cockroach quit --certs-dir=certs --host=<ip>:26257
+```
+
+**❌ NEVER: `kill -9` a CockroachDB node unless absolutely necessary. Always drain first.**
+
+### Add Node(s)
+
+Start new node with `--join` pointing to existing nodes. The cluster auto-rebalances ranges to the new node. Monitor rebalancing progress in DB Console.
+
+### Decommission Node(s)
+
+```bash
+# Move ALL replicas off the node, then mark it as decommissioned
+cockroach node decommission <node-id> --certs-dir=certs --host=<ip>:26257
+# Wait for completion — DO NOT stop the node until all replicas have moved
+```
+
+Monitor decommission progress:
+```sql
+SELECT node_id, is_decommissioning, draining, membership
+FROM crdb_internal.gossip_liveness;
+```
+
+---
+
+## 4. Monitoring & Alert Thresholds
+
+### Critical Alerts (Page Immediately)
+
+| Alert | Condition | Action |
+|-------|-----------|--------|
+| Node down | `liveness.livenodes` decreased | Check node health, restart if needed |
+| Ranges unavailable | `ranges.unavailable > 0` | Check node liveness, network partitions |
+| Storage > 85% | `capacity.used / capacity > 0.85` | Add nodes or increase storage immediately |
+
+### Warning Alerts (Investigate Within Hours)
+
+| Alert | Condition | Action |
+|-------|-----------|--------|
+| Storage > 70% | `capacity.used / capacity > 0.7` | Plan capacity expansion |
+| CPU > 80% sustained | `sys.cpu.combined.percent-normalized > 0.8` | Check for hot ranges, optimize queries |
+| Under-replicated ranges | `ranges.underreplicated > 0` for > 30 min | Check node health, network, storage |
+| LSM read amplification > 20 | `rocksdb.read-amplification > 20` | Check compaction queue, consider maintenance |
+| Version mismatch | Nodes running different versions | Complete rolling upgrade |
+| Certificate expiration | < 30 days to expiry | Rotate certificates |
+| Changefeed lag | Lag exceeds SLA threshold | Check sink, increase memory budget |
+| Intent buildup | `intentbytes` sustained growth > 100MB | Check for long-running transactions |
+| High p99 latency | `sql.exec.latency-p99` > 3x baseline | Check contention, query plans |
+| Transaction abort rate | `sql.txn.abort.count` spike | Check for contention patterns |
+
+### Key Metrics to Export
+
+```yaml
+# Prometheus / Datadog / Grafana categories
+Node Health:
+  - sys.cpu.combined.percent-normalized
+  - sys.rss  # resident memory
+  - capacity.used / capacity
+  - liveness.livenodes
+
+SQL Performance:
+  - sql.exec.latency-p99
+  - sql.distsql.flows.active
+  - sql.conn.latency-p99
+  - sql.txn.abort.count
+
+Replication:
+  - ranges.unavailable  # CRITICAL if > 0
+  - ranges.underreplicated
+  - rebalancing.queriespersecond
+
+Storage (LSM):
+  - rocksdb.read-amplification
+  - rocksdb.compactions
+  - rocksdb.num-sstables
+
+Intents:
+  - intentcount
+  - intentbytes
+```
+
+---
+
+## 5. Diagnostic Queries
+
+```sql
+-- Cluster health overview
+SELECT node_id, address, is_live, is_available,
+       ranges, leases FROM crdb_internal.gossip_nodes;
+
+-- Hot ranges (highest QPS)
+SELECT range_id, start_pretty, end_pretty, lease_holder, queries_per_second
+FROM crdb_internal.ranges ORDER BY queries_per_second DESC LIMIT 10;
+
+-- Long-running queries (> 5 seconds)
+SELECT query, phase, node_id, elapsed
+FROM [SHOW CLUSTER QUERIES]
+WHERE elapsed > '5s' ORDER BY elapsed DESC;
+
+-- Contention events
+SELECT * FROM crdb_internal.cluster_contention_events
+ORDER BY count DESC LIMIT 20;
+
+-- Running jobs (schema changes, backups, imports, changefeeds)
+SELECT job_id, job_type, description, status, fraction_completed, running_status
+FROM crdb_internal.jobs WHERE status = 'running';
+
+-- High-retry transactions
+SELECT key, count, max_retries
+FROM crdb_internal.node_transaction_statistics
+WHERE max_retries > 0 ORDER BY count DESC LIMIT 20;
+
+-- Range distribution across nodes
+SELECT node_id, count(*) AS range_count, sum(range_size) AS total_bytes
+FROM crdb_internal.ranges GROUP BY node_id ORDER BY range_count DESC;
+
+-- Unused indexes (candidates for removal — reduce write amplification)
+SELECT * FROM crdb_internal.index_usage_statistics WHERE total_reads = 0;
+```
+
+---
+
+## 6. Changefeed Management
+
+```sql
+-- List active changefeeds
+SELECT job_id, description, running_status
+FROM crdb_internal.jobs
+WHERE job_type = 'CHANGEFEED' AND status = 'running';
+
+-- Pause changefeed (before maintenance or sink issues)
+PAUSE JOB <job_id>;
+
+-- Resume changefeed
+RESUME JOB <job_id>;
+
+-- Cancel changefeed
+CANCEL JOB <job_id>;
+
+-- Create changefeed with recommended settings
+CREATE CHANGEFEED FOR TABLE orders, customers
+  INTO 'kafka://broker:9092'
+  WITH updated, resolved = '30s',
+       min_checkpoint_frequency = '30s',
+       kafka_sink_config = '{"Flush": {"MaxMessages": 1000, "Frequency": "1s"}}';
+```
+
+**Troubleshooting changefeed lag:**
+- Check sink availability (Kafka broker, S3 bucket, etc.)
+- Increase `changefeed.memory.per_changefeed_limit`
+- Check for schema changes that force changefeed restart
+- Monitor `changefeed.emitted_messages` and `changefeed.emitted_bytes`
+
+---
+
+## 7. Backup & Restore
+
+```sql
+-- Full cluster backup
+BACKUP INTO 's3://bucket/path?AUTH=implicit'
+  AS OF SYSTEM TIME '-10s';
+
+-- Incremental backup (must follow a full backup)
+BACKUP INTO LATEST IN 's3://bucket/path?AUTH=implicit';
+
+-- Scheduled daily backup with retention
+CREATE SCHEDULE daily_backup
+  FOR BACKUP INTO 's3://bucket/backups?AUTH=implicit'
+  RECURRING '@daily'
+  FULL BACKUP ALWAYS
+  WITH SCHEDULE OPTIONS first_run = 'now';
+
+-- Restore full cluster
+RESTORE FROM LATEST IN 's3://bucket/path?AUTH=implicit';
+
+-- Restore specific database
+RESTORE DATABASE mydb FROM LATEST IN 's3://bucket/path?AUTH=implicit';
+
+-- Monitor backup/restore progress
+SELECT job_id, job_type, description, status, fraction_completed,
+       running_status, finished
+FROM crdb_internal.jobs
+WHERE job_type IN ('BACKUP', 'RESTORE')
+ORDER BY created DESC LIMIT 5;
+```
+
+---
+
+## 8. Version Upgrade Procedure
+
+**❌ NEVER: Upgrade all nodes at once or finalize version before all nodes are upgraded**
+
+**✅ ALWAYS: Rolling upgrade, one node at a time**
+
+1. Review release notes for breaking changes and deprecations
+2. Stage the new binary on ALL nodes (download but don't start)
+3. For each node (one at a time):
+   ```bash
+   cockroach node drain <id> --certs-dir=certs --host=<ip>:26257
+   # Stop the node process
+   # Replace binary with new version
+   cockroach start <same flags>
+   ```
+4. Wait for the restarted node to rejoin and report `is_live = true`
+5. Repeat for next node
+6. After ALL nodes run the new version:
+   ```sql
+   SET CLUSTER SETTING version = crdb_internal.node_executable_version();
+   ```
+7. **NEVER roll back after finalizing the version**
+
+---
+
+## 9. Region Migration
+
+```sql
+-- Add a new region to the database
+ALTER DATABASE mydb ADD REGION "eu-west-1";
+
+-- Change primary region
+ALTER DATABASE mydb SET PRIMARY REGION "eu-west-1";
+
+-- Drop old region (ONLY after data has fully rebalanced)
+ALTER DATABASE mydb DROP REGION "us-east-1";
+
+-- Monitor rebalancing progress
+SELECT lease_holder, count(*) AS ranges
+FROM crdb_internal.ranges
+WHERE database_name = 'mydb'
+GROUP BY lease_holder;
+```
+
+---
+
+## 10. Troubleshooting SQL Workload Contention
+
+**Symptoms:** High 40001 rate, elevated p99, intent buildup
+
+```sql
+-- Step 1: Find contention events
+SELECT * FROM crdb_internal.cluster_contention_events ORDER BY count DESC LIMIT 10;
+
+-- Step 2: Identify hot ranges
+SELECT range_id, start_pretty, end_pretty, lease_holder, queries_per_second
+FROM crdb_internal.ranges ORDER BY queries_per_second DESC LIMIT 5;
+
+-- Step 3: Check transaction retries
+SELECT key, count, max_retries FROM crdb_internal.node_transaction_statistics
+WHERE max_retries > 3 ORDER BY count DESC LIMIT 10;
+```
+
+**Resolution:**
+- Sequential PKs (SERIAL) → switch to UUID `gen_random_uuid()`
+- Long transactions → shorten scope, split reads from writes
+- Hot rows → use `SELECT ... FOR UPDATE` to serialize early, or shard the data
+- Read contention → use `AS OF SYSTEM TIME` for stale-tolerant reads
+
+---
+
+## 11. Troubleshooting Hardware Resource Contention
+
+**CPU hotspot on one node (others idle):**
+- Likely cause: SERIAL primary key routing all writes to one leaseholder
+- Diagnosis: Hot Ranges page in DB Console, or:
+  ```sql
+  SELECT node_id, sum(queries_per_second) AS total_qps
+  FROM crdb_internal.ranges GROUP BY node_id ORDER BY total_qps DESC;
+  ```
+- Fix: Switch to UUID primary keys
+
+**General high CPU:**
+- Add nodes (horizontal scaling)
+- Optimize hot queries (EXPLAIN ANALYZE)
+- Reduce contention (shorter transactions)
+
+**Memory pressure:**
+- Check for large result sets in queries
+- Tune `--cache` (default 25% of system RAM) and `--max-sql-memory` (default 25%)
+- Check for changefeed memory usage
+
+**Disk I/O saturation:**
+- Check LSM compaction backlog: `rocksdb.compactions`, `rocksdb.read-amplification`
+- Consider faster storage (NVMe SSDs)
+- Check for large tables that need TTL expiration
+
+---
+
+## 12. Emergency Procedures
+
+### Node Replace (Hardware Failure)
+
+1. Decommission the failed node: `cockroach node decommission <id>`
+2. Wait for ALL replicas to move off (monitor with `SHOW RANGES`)
+3. Provision new node with **same locality flags**
+4. Start new node with `--join` pointing to existing cluster
+5. Verify rebalancing completes and range counts equalize
+
+### Node Wipe (Data Corruption)
+
+1. Stop the node: `cockroach quit` or stop the process
+2. Remove the store directory: `rm -rf <store-path>`
+3. Restart the node — it rejoins as empty and receives replicas from peers
+
+### LSM Compaction Emergency
+
+If read amplification is critically high (> 50) and queries are severely impacted:
+
+```bash
+# CAUTION: Offline operation — node must be stopped
+cockroach debug compact <store-path>
+# Restart the node after compaction completes
+```
+
+### CockroachDB Server/VM Replacement
+
+1. Drain the node: `cockroach node drain <id>`
+2. Decommission: `cockroach node decommission <id>`
+3. Wait for all replicas to move
+4. Provision replacement VM with identical specs and locality
+5. Start fresh CockroachDB node on replacement VM
+6. Verify cluster health and range distribution
+
+---
+
+## 13. Capacity Planning
+
+| Resource | Guideline |
+|----------|-----------|
+| CPU | ~500-1000 simple QPS per vCPU (workload dependent) |
+| Memory | 4GB+ per vCPU; `--cache=0.25`, `--max-sql-memory=0.25` |
+| Storage | 4x data size (RF3 + headroom + compaction temp space) |
+| Connections | Default 100 per node (CockroachDB Cloud); plan pool sizing |
+| Nodes | Minimum 3 for zone survival, 5 for region survival |
+| Regions | 3+ regions for `SURVIVE REGION FAILURE` |
+
+**Scaling:** Add nodes to scale horizontally. CockroachDB auto-rebalances. No resharding or manual partition management required.
+
+---
+
+## 14. Query Parallelism for Bulk Operations
+
+For batch DML exceeding 250K-500K rows (or 1M+ without secondary indexes):
+
+**✅ ALWAYS: Split into parallel threads over DISJOINTED key ranges**
+
+```bash
+# Example: 4 parallel threads on 7M rows — completes in ~2 minutes
+# vs single-threaded: timeouts and retries
+
+# Step 1: Read key boundaries
+cockroach sql --execute "SELECT id FROM large_table ORDER BY id"
+
+# Step 2: Partition into N non-overlapping ranges
+# Step 3: Run parallel DELETE/UPDATE per range (each as implicit transaction)
+```
+
+**Rules:**
+- NEVER overlap key ranges between threads → causes 40001 failures
+- Use implicit transactions (no explicit BEGIN/COMMIT)
+- Run during maintenance windows
+- When atomicity is required across tables, use CTE-based set operations
+
+---
+
+## Anti-Pattern Quick Reference (Operator-Specific)
+
+| ❌ Anti-Pattern | Why | ✅ Fix |
+|---|---|---|
+| `kill -9` without draining | In-flight queries interrupted, leases stuck | Always `cockroach node drain` first |
+| Upgrade all nodes simultaneously | Risk of cluster unavailability | Rolling upgrade, one node at a time |
+| Finalize version before all nodes upgraded | Cannot roll back | Upgrade ALL nodes, then `SET CLUSTER SETTING version` |
+| No backup schedule | Data loss on failure | `CREATE SCHEDULE FOR BACKUP` |
+| `root` user in production | No audit trail, unlimited permissions | Custom DBA role with scoped grants |
+| No alerting on `ranges.unavailable` | Data unavailability goes undetected | Alert immediately if > 0 |
+| Ignoring LSM read amplification | Queries degrade silently | Alert at > 20, investigate compaction |
+| Overlapping key ranges in parallel DML | Serialization failures | Partition into disjoint ranges |
+| Decommission without waiting | Replicas lost, under-replication | Wait for all replicas to move off |
+| No clock sync (NTP) | Clock skew → transaction errors | Configure NTP, set `--max-offset` |
