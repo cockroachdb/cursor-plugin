@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.1...v0.1.2) (2026-03-27)
+
+
+### Features
+
+* add Cloud MCP and ccloud CLI GA support, replace skill symlinks with real directories ([a160eca](https://github.com/cockroachdb/cursor-plugin/commit/a160ecac9f4d8ac48aeb5a21c569efa9a68dca99))
+
 ## [0.1.1](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.0...v0.1.1) (2026-03-17)
 
 
