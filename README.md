@@ -35,6 +35,7 @@ export COCKROACHDB_PORT="26257"
 export COCKROACHDB_USER="your-user"
 export COCKROACHDB_PASSWORD="your-password"
 export COCKROACHDB_DATABASE="your-database"
+export COCKROACHDB_SSLMODE="verify-full"
 ```
 
 For CockroachDB Cloud, find connection details in the [Cloud Console](https://cockroachlabs.cloud/).
