@@ -16,20 +16,11 @@
       "url": "http://127.0.0.1:5000/mcp",
       "_comment": "Streamable HTTP transport — run 'toolbox --tools-file tools.yaml' first, then connect via this URL"
     },
-    "ccloud": {
-      "command": "ccloud",
-      "args": ["mcp"],
-      "_comment": "CockroachDB Cloud CLI — manage clusters, backups, networking, and infrastructure. Coming soon.",
-      "env": {
-        "CCLOUD_API_KEY": "${CCLOUD_API_KEY}"
-      }
-    },
     "cockroachdb-cloud": {
       "type": "http",
       "url": "https://cockroachlabs.cloud/mcp",
-      "_comment": "Official CockroachDB Cloud MCP Server — OAuth 2.0 + API key auth. 12 tools: get_cluster_status, show_running_queries, list_databases, switch_database, create_database, list_tables, describe_table, create_table, list_columns, list_indexes, execute_query, explain_query. Read-only by default. Requires CockroachDB Cloud account.",
-      "env": {
-        "COCKROACHDB_CLOUD_API_KEY": "${COCKROACHDB_CLOUD_API_KEY}"
+      "headers": {
+        "mcp-cluster-id": "${COCKROACHDB_CLUSTER_ID}"
       }
     }
   }
