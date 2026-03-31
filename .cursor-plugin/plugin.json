@@ -7,13 +7,9 @@
     "name": "Virag Tripathi",
     "email": "virag.tripathi@gmail.com"
   },
-  "publisher": "viragtripathi",
-  "category": "database",
-  "homepage": "https://github.com/cockroachdb/cursor-plugin",
   "repository": "https://github.com/cockroachdb/cursor-plugin",
   "license": "Apache-2.0",
   "logo": "assets/logo.svg",
-  "primaryColor": "#6933FF",
   "keywords": [
     "cockroachdb",
     "database",
@@ -24,8 +20,5 @@
     "schema",
     "migration",
     "multi-region"
-  ],
-  "skills": "./skills/",
-  "rules": "./rules/",
-  "mcpServers": "./mcp.json"
+  ]
 }
