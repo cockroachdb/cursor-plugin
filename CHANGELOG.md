@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.2...v0.1.3) (2026-03-31)
+
+
+### Bug Fixes
+
+* remove unsupported plugin.json fields that break Cursor install ([1cfd2ab](https://github.com/cockroachdb/cursor-plugin/commit/1cfd2abe3ba84e9128d331a8895b0f584cab4143))
+
 ## [0.1.2](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.1...v0.1.2) (2026-03-27)
 
 
