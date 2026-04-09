@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.3...v0.1.4) (2026-04-09)
+
+
+### Bug Fixes
+
+* restructure skills to match upstream category hierarchy ([bb22bdc](https://github.com/cockroachdb/cursor-plugin/commit/bb22bdcd812e484f60b5cd87ae94f6d669dee3e8))
+
 ## [0.1.3](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.2...v0.1.3) (2026-03-31)
 
 
