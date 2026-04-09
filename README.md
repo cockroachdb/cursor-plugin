@@ -7,13 +7,11 @@ The CockroachDB plugin for [Cursor](https://cursor.com/) gives your AI coding ag
 
 ## Installation
 
-In Cursor, run:
+Install from the [Cursor Marketplace](https://cursor.com/marketplace/cockroachdb), or in Cursor run:
 
 ```
 /add-plugin cockroachdb
 ```
-
-Or install from the [Cursor Marketplace](https://cursor.com/marketplace).
 
 ### Prerequisites
 
