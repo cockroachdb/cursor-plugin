@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.4...v0.1.5) (2026-04-10)
+
+
+### Bug Fixes
+
+* add explicit skills paths to plugin.json for marketplace discovery ([3560a82](https://github.com/cockroachdb/cursor-plugin/commit/3560a82dfe9362e445b446b8324f724448ad8f83))
+
 ## [0.1.4](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.3...v0.1.4) (2026-04-09)
 
 
