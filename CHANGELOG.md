@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.5...v0.1.6) (2026-04-12)
+
+
+### Bug Fixes
+
+* add COCKROACHDB_SSLMODE env var to mcp.json for parity with claude-plugin ([4bbc9fc](https://github.com/cockroachdb/cursor-plugin/commit/4bbc9fc2a69b79aee772c581419ac4a7559a272b))
+
 ## [0.1.5](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.4...v0.1.5) (2026-04-10)
 
 
