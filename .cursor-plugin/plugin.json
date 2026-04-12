@@ -1,7 +1,7 @@
 {
   "name": "cockroachdb",
   "displayName": "CockroachDB",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "CockroachDB plugin for Cursor — explore schemas, write optimized SQL, debug queries, and manage distributed database clusters directly from your AI coding agent.",
   "author": {
     "name": "Virag Tripathi",
