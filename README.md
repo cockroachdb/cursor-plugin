@@ -49,7 +49,9 @@ Connect to any CockroachDB cluster (Cloud, self-hosted, local) via [MCP Toolbox 
 
 **Run (stdio, default):** `toolbox --tools-file tools.yaml --stdio`
 
-**Run (HTTP):** `toolbox --tools-file tools.yaml --address 0.0.0.0:5000`
+**Run (HTTP):** `toolbox --tools-file tools.yaml --address 0.0.0.0 --port 5000`
+
+> **Note:** Toolbox must successfully connect to CockroachDB on startup. If the database is unreachable (wrong host/port, env vars not set), the server will hang during initialization and the UI will be stuck on "fetching tools". Make sure your `COCKROACHDB_*` environment variables are set and the database is accessible before starting.
 </details>
 
 <details>
