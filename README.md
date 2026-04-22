@@ -17,7 +17,7 @@ Install from the [Cursor Marketplace](https://cursor.com/marketplace/cockroachdb
 
 This plugin connects to CockroachDB via MCP (Model Context Protocol). Choose the backend that fits your setup — see [MCP Backends](#mcp-backends) below.
 
-For the **MCP Toolbox** backend (available now), install [MCP Toolbox for Databases](https://github.com/googleapis/genai-toolbox) (v0.27.0+):
+For the **MCP Toolbox** backend (available now), install [MCP Toolbox for Databases](https://github.com/googleapis/mcp-toolbox) (v1.0.0+):
 
 ```bash
 brew install mcp-toolbox
@@ -43,15 +43,15 @@ For CockroachDB Cloud, find connection details in the [Cloud Console](https://co
 <details>
 <summary><strong>MCP Toolbox</strong> (self-hosted, any cluster) — Default</summary>
 
-Connect to any CockroachDB cluster (Cloud, self-hosted, local) via [MCP Toolbox for Databases](https://github.com/googleapis/genai-toolbox).
+Connect to any CockroachDB cluster (Cloud, self-hosted, local) via [MCP Toolbox for Databases](https://github.com/googleapis/mcp-toolbox).
 
-**Install:** `brew install mcp-toolbox` (v0.27.0+)
+**Install:** `brew install mcp-toolbox` (v1.0.0+)
 
-**Run (stdio, default):** `toolbox --tools-file tools.yaml --stdio`
+**Run (stdio, default):** `toolbox --config tools.yaml --stdio`
 
-**Run (HTTP):** `toolbox --tools-file tools.yaml --address 0.0.0.0 --port 5000`
+**Run (HTTP):** `toolbox --config tools.yaml --address 0.0.0.0 --port 5000`
 
-**Run (with web UI):** `toolbox --tools-file tools.yaml --ui --port 5000` (opens at `http://127.0.0.1:5000/ui`)
+**Run (with web UI):** `toolbox --config tools.yaml --ui --port 5000` (opens at `http://127.0.0.1:5000/ui`)
 
 > **Note:** Toolbox must successfully connect to CockroachDB on startup. If the database is unreachable (wrong host/port, env vars not set), the server will hang during initialization and the UI will be stuck on "Fetching tools...". Make sure your `COCKROACHDB_*` environment variables are set and the database is accessible before starting.
 </details>
@@ -151,7 +151,7 @@ See the [quickstart guide](https://www.cockroachlabs.com/docs/cockroachcloud/con
 
 | Backend                    | Status      | Transport       | Use Case                                                                                                                          |
 |----------------------------|-------------|-----------------|-----------------------------------------------------------------------------------------------------------------------------------|
-| `cockroachdb-toolbox`      | Active      | stdio           | Any CockroachDB cluster via [MCP Toolbox](https://github.com/googleapis/genai-toolbox)                                            |
+| `cockroachdb-toolbox`      | Active      | stdio           | Any CockroachDB cluster via [MCP Toolbox](https://github.com/googleapis/mcp-toolbox)                                            |
 | `cockroachdb-cloud`        | Active      | Streamable HTTP | [Managed MCP Server](https://www.cockroachlabs.com/blog/cockroachdb-ai-agents-managed-mcp-server/) — CockroachDB Cloud (OAuth/API key) |
 | `cockroachdb-toolbox-http` | Available   | Streamable HTTP | MCP Toolbox remote/multi-user via HTTP                                                                                            |
 
@@ -240,7 +240,7 @@ This repo uses [Release Please](https://github.com/googleapis/release-please) fo
 - [Cloud MCP Quickstart Guide](https://www.cockroachlabs.com/docs/cockroachcloud/connect-to-the-cockroachdb-cloud-mcp-server)
 - [ccloud CLI for AI Agents Blog Post](https://www.cockroachlabs.com/blog/cockroachdb-ai-agents-cli-database-automation/)
 - [ccloud CLI Reference](https://www.cockroachlabs.com/docs/cockroachcloud/ccloud-get-started)
-- [MCP Toolbox for Databases](https://github.com/googleapis/genai-toolbox)
+- [MCP Toolbox for Databases](https://github.com/googleapis/mcp-toolbox)
 - [Report Issues](https://github.com/cockroachdb/cursor-plugin/issues)
 
 ## License
