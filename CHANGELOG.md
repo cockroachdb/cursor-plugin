@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.7](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.6...v0.1.7) (2026-04-22)
+
+
+### Bug Fixes
+
+* migrate toolbox config to v1.1.0 map-based format ([2130c90](https://github.com/cockroachdb/cursor-plugin/commit/2130c90a6ab2e4178cb92756e00a5bbcd09664cc))
+
 ## [0.1.6](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.5...v0.1.6) (2026-04-12)
 
 
