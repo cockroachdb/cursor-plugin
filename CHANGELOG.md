@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.8](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.7...v0.1.8) (2026-05-03)
+
+
+### Features
+
+* add setup-cockroachdb.sh for local 3-node cluster provisioning ([fabeefa](https://github.com/cockroachdb/cursor-plugin/commit/fabeefa81fbfc65dcbde323419d4824d7362d676))
+
 ## [0.1.7](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.6...v0.1.7) (2026-04-22)
 
 
