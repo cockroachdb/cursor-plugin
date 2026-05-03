@@ -23,20 +23,6 @@ For the **MCP Toolbox** backend (available now), install [MCP Toolbox for Databa
 brew install mcp-toolbox
 ```
 
-### Local Cluster (optional)
-
-Need a local CockroachDB to point the agent at? The repo ships a helper script that provisions a local multi-node insecure cluster on `localhost`:
-
-```bash
-./scripts/setup-cockroachdb.sh start     # start the cluster
-./scripts/setup-cockroachdb.sh status    # show running nodes
-./scripts/setup-cockroachdb.sh stop      # stop nodes (data preserved)
-./scripts/setup-cockroachdb.sh destroy   # stop and remove all data
-./scripts/setup-cockroachdb.sh --help    # all options (--nodes, --version, --port, ...)
-```
-
-The matching `setting-up-local-cluster` skill walks the agent through using it.
-
 ## Configuration
 
 Set environment variables for your CockroachDB connection:
@@ -232,8 +218,6 @@ cd cursor-plugin
 .cursor-plugin/plugin.json    # Plugin manifest
 skills/                       # Skills from cockroachdb-skills submodule
 rules/                        # Rule sets (.mdc files)
-scripts/
-  setup-cockroachdb.sh        # Local multi-node cluster provisioning script
 mcp.json                      # MCP server definitions (Toolbox + Cloud MCP)
 tools.yaml                    # Toolbox source & tool configuration
 submodules/cockroachdb-skills # Shared skills submodule
