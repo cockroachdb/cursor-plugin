@@ -3,7 +3,7 @@
 [![Release Please](https://github.com/cockroachdb/cursor-plugin/actions/workflows/release-please.yml/badge.svg)](https://github.com/cockroachdb/cursor-plugin/actions/workflows/release-please.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Connect [Cursor](https://cursor.com/) directly to your CockroachDB clusters for hands-on database work — explore schemas, write optimized SQL, debug queries, and manage distributed database clusters. This plugin provides tools across two active MCP backends (self-hosted MCP Toolbox and managed CockroachDB Cloud MCP Server), three specialized agents (DBA, Developer, Operator), skills across multiple operational domains, and built-in safety hooks.
+Connect [Cursor](https://cursor.com/) directly to your CockroachDB clusters for hands-on database work — explore schemas, write optimized SQL, debug queries, and manage distributed database clusters. This plugin provides tools across MCP backends (self-hosted MCP Toolbox and managed CockroachDB Cloud MCP Server), specialized agents (DBA, Developer, Operator), skills across operational domains, and built-in safety and best-practice rules.
 
 ## Installation
 
