@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.9](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.8...v0.1.9) (2026-10-09)
+
+
+### Bug Fixes
+
+* make the bundled MCP servers start in Cursor ([#18](https://github.com/cockroachdb/cursor-plugin/issues/18)) ([b04743a](https://github.com/cockroachdb/cursor-plugin/commit/b04743a5370549f15c7a84557cf9fdce58c19f4f))
+
 ## [0.1.8](https://github.com/cockroachdb/cursor-plugin/compare/v0.1.7...v0.1.8) (2026-05-03)
 
 
