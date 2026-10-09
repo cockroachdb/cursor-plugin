@@ -21,6 +21,46 @@
     "migration",
     "multi-region"
   ],
+  "variables": {
+    "type": "object",
+    "properties": {
+      "COCKROACHDB_HOST": {
+        "type": "string",
+        "title": "Cluster host",
+        "description": "Host of the cluster the MCP Toolbox server connects to. Leave blank for localhost."
+      },
+      "COCKROACHDB_PORT": {
+        "type": "string",
+        "title": "Cluster port",
+        "description": "SQL port. Leave blank for 26257."
+      },
+      "COCKROACHDB_USER": {
+        "type": "string",
+        "title": "SQL user",
+        "description": "SQL user for the MCP Toolbox server. Leave blank for root."
+      },
+      "COCKROACHDB_PASSWORD": {
+        "type": "string",
+        "title": "SQL password",
+        "description": "Password for the SQL user. Leave blank for none."
+      },
+      "COCKROACHDB_DATABASE": {
+        "type": "string",
+        "title": "Database",
+        "description": "Database to connect to. Leave blank for defaultdb."
+      },
+      "COCKROACHDB_SSLMODE": {
+        "type": "string",
+        "title": "SSL mode",
+        "description": "disable for a local --insecure cluster, require or verify-full otherwise. Leave blank for require."
+      },
+      "COCKROACHDB_CLUSTER_ID": {
+        "type": "string",
+        "title": "CockroachDB Cloud cluster ID",
+        "description": "Limits the CockroachDB Cloud MCP server to one cluster. Leave blank to reach every cluster your role allows."
+      }
+    }
+  },
   "skills": [
     "./skills/cockroachdb-application-development/benchmarking-transaction-patterns",
     "./skills/cockroachdb-application-development/designing-application-transactions",
