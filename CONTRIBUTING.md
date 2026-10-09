@@ -33,7 +33,7 @@ export COCKROACHDB_SSLMODE=disable
 ```
 .cursor-plugin/
   plugin.json              # Plugin manifest (version managed by Release Please)
-mcp.json                   # MCP server definitions (stdio, HTTP, Cloud)
+mcp.json                   # MCP server definitions (Toolbox stdio, Cloud)
 tools.yaml                 # MCP Toolbox source and tool definitions
 rules/                     # Cursor rule files (.mdc format)
 skills/                    # Copied from cockroachdb-skills submodule (do not edit directly)
@@ -105,8 +105,10 @@ This repo uses [Release Please](https://github.com/googleapis/release-please) fo
 
 ### MCP Configuration
 
-- `mcp.json` (no dot prefix) defines MCP server backends for Cursor.
-- Use `${ENV_VAR}` syntax for environment variable references.
+- `mcp.json` (no dot prefix) defines MCP server backends for Cursor. Don't add a `.mcp.json` as well: Cursor reads it before `mcp.json`.
+- Reference bundled files through `${CURSOR_PLUGIN_ROOT}`, as in `${CURSOR_PLUGIN_ROOT}/tools.yaml`. Cursor starts plugin MCP servers in the user's home directory, so a relative path never reaches the plugin folder.
+- Reference variables as `${VAR:-default}`, never as a bare `${VAR}`: Cursor passes an unset bare reference through as the literal text `${VAR}` (issue cockroachdb/claude-plugin#27). Don't use `${env:VAR}` either, because it resolves to an empty string, and Toolbox uses an empty value as-is instead of its default. Give each Toolbox connection setting a non-empty default that matches `tools.yaml`; only `COCKROACHDB_PASSWORD` and the optional `mcp-cluster-id` header default to empty.
+- Declare every variable that `mcp.json` references under `variables` in `.cursor-plugin/plugin.json`, so users can set it under **Plugins** → **Configure**.
 - The `tools.yaml` file uses Toolbox v1.1.0 map-based format with `${VAR:default}` syntax for defaults.
 
 ### Skills
